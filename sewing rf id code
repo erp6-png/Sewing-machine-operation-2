@@ -1,0 +1,308 @@
+// HW-147C (Si512 / PN512 / MFRC522-compatible) - Card UID reader over SPI
+// No external library needed. No pull-ups needed (SPI lines are push-pull).
+//
+// ===== SWITCH =====
+//   SW1 = OFF, SW2 = ON  (SPI mode)  -> unplug USB after changing it
+//
+// ===== CONNECTIONS (8-pin SIDE header - pins must be soldered) =====
+//   Reader SCK  -> ESP32 GPIO18
+//   Reader MISO -> ESP32 GPIO19
+//   Reader MOSI -> ESP32 GPIO23
+//   Reader SS   -> ESP32 GPIO5
+//   Reader VCC  -> ESP32 3.3V   (NOT 5V)
+//   Reader GND  -> ESP32 GND
+//   Reader IRQ  -> not connected
+//   Reader RST  -> not connected (board pull-up keeps it HIGH)
+//   Top 4-pin header (SDA/SCL) -> nothing connected
+//
+// Cards: 13.56 MHz ISO14443A (MIFARE Classic, Ultralight, NTAG, etc.)
+
+#include <SPI.h>
+
+#define PIN_SCK   18
+#define PIN_MISO  19
+#define PIN_MOSI  23
+#define PIN_SS    5
+#define PIN_RST   -1        // -1 = not connected. Set e.g. 27 only if RST is wired.
+
+#define SPI_FREQ  1000000   // 1 MHz - very safe for jumper wires
+
+// ---- Registers ----
+#define CommandReg     0x01
+#define ComIrqReg      0x04
+#define DivIrqReg      0x05
+#define ErrorReg       0x06
+#define FIFODataReg    0x09
+#define FIFOLevelReg   0x0A
+#define ControlReg     0x0C
+#define BitFramingReg  0x0D
+#define CollReg        0x0E
+#define ModeReg        0x11
+#define TxControlReg   0x14
+#define TxASKReg       0x15
+#define CRCResultRegH  0x21
+#define CRCResultRegL  0x22
+#define RFCfgReg       0x26
+#define TModeReg       0x2A
+#define TPrescalerReg  0x2B
+#define TReloadRegH    0x2C
+#define TReloadRegL    0x2D
+#define VersionReg     0x37
+
+#define EXPECTED_VERSION 0xB2
+
+// ---- Commands ----
+#define CMD_IDLE       0x00
+#define CMD_CALCCRC    0x03
+#define CMD_TRANSCEIVE 0x0C
+#define CMD_SOFTRESET  0x0F
+
+enum Status { ST_OK, ST_TIMEOUT, ST_ERROR, ST_NOROOM };
+
+SPISettings spiSettings(SPI_FREQ, MSBFIRST, SPI_MODE0);
+
+// ---------- Low-level SPI ----------
+// Address byte: write = (reg << 1) & 0x7E, read = 0x80 | (reg << 1)
+void writeReg(uint8_t reg, uint8_t val) {
+  SPI.beginTransaction(spiSettings);
+  digitalWrite(PIN_SS, LOW);
+  delayMicroseconds(2);
+  SPI.transfer((reg << 1) & 0x7E);
+  SPI.transfer(val);
+  delayMicroseconds(2);
+  digitalWrite(PIN_SS, HIGH);
+  SPI.endTransaction();
+}
+
+uint8_t readReg(uint8_t reg) {
+  SPI.beginTransaction(spiSettings);
+  digitalWrite(PIN_SS, LOW);
+  delayMicroseconds(2);
+  SPI.transfer(0x80 | ((reg << 1) & 0x7E));
+  uint8_t val = SPI.transfer(0x00);
+  delayMicroseconds(2);
+  digitalWrite(PIN_SS, HIGH);
+  SPI.endTransaction();
+  return val;
+}
+
+void setBits(uint8_t reg, uint8_t mask)   { writeReg(reg, readReg(reg) | mask); }
+void clearBits(uint8_t reg, uint8_t mask) { writeReg(reg, readReg(reg) & ~mask); }
+
+// ---------- Reset ----------
+void resetReader() {
+  if (PIN_RST >= 0) {               // hard reset only if RST is wired
+    digitalWrite(PIN_RST, LOW);
+    delay(10);
+    digitalWrite(PIN_RST, HIGH);
+    delay(50);
+  }
+  writeReg(CommandReg, CMD_SOFTRESET);  // soft reset always
+  delay(50);
+}
+
+// ---------- CRC (chip coprocessor) ----------
+bool calcCRC(const uint8_t *data, uint8_t len, uint8_t *out) {
+  writeReg(CommandReg, CMD_IDLE);
+  writeReg(DivIrqReg, 0x04);          // clear CRCIRq
+  writeReg(FIFOLevelReg, 0x80);       // flush FIFO
+  for (uint8_t i = 0; i < len; i++) writeReg(FIFODataReg, data[i]);
+  writeReg(CommandReg, CMD_CALCCRC);
+
+  uint32_t t = millis();
+  while (millis() - t < 50) {
+    if (readReg(DivIrqReg) & 0x04) {
+      writeReg(CommandReg, CMD_IDLE);
+      out[0] = readReg(CRCResultRegL);
+      out[1] = readReg(CRCResultRegH);
+      return true;
+    }
+  }
+  return false;
+}
+
+// ---------- Send/receive to card ----------
+Status transceive(const uint8_t *send, uint8_t sendLen,
+                  uint8_t *back, uint8_t *backLen, uint8_t txLastBits = 0) {
+  writeReg(CommandReg, CMD_IDLE);
+  writeReg(ComIrqReg, 0x7F);          // clear all IRQ flags
+  writeReg(FIFOLevelReg, 0x80);       // flush FIFO
+  for (uint8_t i = 0; i < sendLen; i++) writeReg(FIFODataReg, send[i]);
+  writeReg(BitFramingReg, txLastBits);
+  writeReg(CommandReg, CMD_TRANSCEIVE);
+  setBits(BitFramingReg, 0x80);       // StartSend
+
+  bool done = false;
+  uint32_t t = millis();
+  while (millis() - t < 50) {
+    uint8_t irq = readReg(ComIrqReg);
+    if (irq & 0x30) { done = true; break; }   // RxIRq or IdleIRq
+    if (irq & 0x01) break;                    // TimerIRq = no card answer
+  }
+  clearBits(BitFramingReg, 0x80);
+  if (!done) return ST_TIMEOUT;
+
+  if (readReg(ErrorReg) & 0x1B) return ST_ERROR;  // buffer/collision/parity/protocol
+
+  uint8_t n = readReg(FIFOLevelReg);
+  if (n > *backLen) return ST_NOROOM;
+  *backLen = n;
+  for (uint8_t i = 0; i < n; i++) back[i] = readReg(FIFODataReg);
+  return ST_OK;
+}
+
+// ---------- Reader init ----------
+void initReader() {
+  writeReg(TModeReg, 0x80);       // timer auto-start after transmit
+  writeReg(TPrescalerReg, 0xA9);  // ~40 kHz timer
+  writeReg(TReloadRegH, 0x03);    // ~25 ms timeout
+  writeReg(TReloadRegL, 0xE8);
+  writeReg(TxASKReg, 0x40);       // 100% ASK modulation
+  writeReg(ModeReg, 0x3D);        // CRC preset 0x6363
+  writeReg(ControlReg, 0x10);     // Initiator (reader) mode - needed on PN512/Si512
+  writeReg(RFCfgReg, 0x70);       // max receiver gain
+  setBits(TxControlReg, 0x03);    // antenna ON (TX1 + TX2)
+}
+
+// Explain what a wrong VersionReg value means
+void explainVersion(uint8_t v) {
+  if (v == 0x00)      Serial.println("    -> 0x00: MISO held LOW. Check reader power (LED), RST not pulled low, MISO not on GND.");
+  else if (v == 0xFF) Serial.println("    -> 0xFF: MISO floating. Check switch = SPI + USB unplugged, SS wire, side header soldered.");
+  else                Serial.println("    -> Other value: SCK/MOSI may be swapped, or noisy wires.");
+}
+
+// Reset + check version + init, with retries
+bool connectReader(int attempts) {
+  for (int i = 1; i <= attempts; i++) {
+    resetReader();
+    uint8_t v = readReg(VersionReg);
+    if (v == EXPECTED_VERSION) {
+      initReader();
+      return true;
+    }
+    Serial.printf("  attempt %d: VersionReg = 0x%02X (expected 0x%02X)\n", i, v, EXPECTED_VERSION);
+    if (i == 1) explainVersion(v);
+    delay(300);
+  }
+  return false;
+}
+
+// ---------- Read card UID (4, 7 or 10 bytes) ----------
+bool readCardUID(uint8_t *uid, uint8_t &uidLen, uint8_t &sak) {
+  uint8_t buf[5];
+  uint8_t len = 2;
+  uint8_t reqa = 0x26;
+
+  clearBits(CollReg, 0x80);
+  if (transceive(&reqa, 1, buf, &len, 0x07) != ST_OK || len != 2) return false;  // ATQA
+
+  const uint8_t selCodes[3] = {0x93, 0x95, 0x97};
+  uidLen = 0;
+
+  for (uint8_t level = 0; level < 3; level++) {
+    uint8_t anti[2] = {selCodes[level], 0x20};
+    len = 5;
+    if (transceive(anti, 2, buf, &len) != ST_OK || len != 5) return false;
+    if ((buf[0] ^ buf[1] ^ buf[2] ^ buf[3]) != buf[4]) return false;   // BCC check
+
+    uint8_t sel[9] = {selCodes[level], 0x70, buf[0], buf[1], buf[2], buf[3], buf[4]};
+    if (!calcCRC(sel, 7, &sel[7])) return false;
+    uint8_t sakBuf[3];
+    len = 3;
+    if (transceive(sel, 9, sakBuf, &len) != ST_OK || len != 3) return false;
+    sak = sakBuf[0];
+
+    if (buf[0] == 0x88) {             // cascade tag: 3 real UID bytes
+      memcpy(&uid[uidLen], &buf[1], 3);
+      uidLen += 3;
+    } else {
+      memcpy(&uid[uidLen], buf, 4);
+      uidLen += 4;
+    }
+    if (!(sak & 0x04)) return true;   // UID complete
+  }
+  return false;
+}
+
+// ---------- Put card to sleep (so one tap = one read) ----------
+void haltCard() {
+  uint8_t hlt[4] = {0x50, 0x00};
+  calcCRC(hlt, 2, &hlt[2]);
+  uint8_t dummy[2];
+  uint8_t len = sizeof(dummy);
+  transceive(hlt, 4, dummy, &len);    // no answer expected
+}
+
+const char *cardType(uint8_t sak) {
+  switch (sak) {
+    case 0x08: return "MIFARE Classic 1K";
+    case 0x18: return "MIFARE Classic 4K";
+    case 0x09: return "MIFARE Mini";
+    case 0x00: return "MIFARE Ultralight / NTAG";
+    case 0x20: return "ISO 14443-4 (DESFire / phone / bank card)";
+    default:   return "Unknown";
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(800);
+  Serial.println("\n===== HW-147C UID READER (SPI) =====");
+  Serial.printf("SCK=%d MISO=%d MOSI=%d SS=%d RST=%d  SPI=%d Hz\n",
+                PIN_SCK, PIN_MISO, PIN_MOSI, PIN_SS, PIN_RST, SPI_FREQ);
+
+  pinMode(PIN_SS, OUTPUT);
+  digitalWrite(PIN_SS, HIGH);
+  if (PIN_RST >= 0) {
+    pinMode(PIN_RST, OUTPUT);
+    digitalWrite(PIN_RST, HIGH);
+  }
+  delay(100);                         // let the reader power up
+
+  SPI.begin(PIN_SCK, PIN_MISO, PIN_MOSI, PIN_SS);
+
+  while (!connectReader(10)) {
+    Serial.println("Reader not responding over SPI. Fix wiring/switch, then press EN.");
+    delay(2000);
+  }
+
+  Serial.printf("Reader found. VersionReg = 0x%02X\n", readReg(VersionReg));
+  Serial.printf("Antenna TxControlReg = 0x%02X (low 2 bits should be 11)\n", readReg(TxControlReg));
+  Serial.println("Ready. Place a 13.56 MHz card flat on the white coil area...");
+}
+
+void loop() {
+  static uint32_t lastBeat = 0;
+  static uint32_t lastHealth = 0;
+
+  // Health check every 2 s - auto-recover if the reader stops answering
+  if (millis() - lastHealth > 2000) {
+    lastHealth = millis();
+    if (readReg(VersionReg) != EXPECTED_VERSION) {
+      Serial.println("Reader lost - recovering...");
+      while (!connectReader(10)) delay(1000);
+      Serial.println("Reader recovered.");
+    }
+  }
+
+  uint8_t uid[10];
+  uint8_t uidLen = 0, sak = 0;
+
+  if (readCardUID(uid, uidLen, sak)) {
+    Serial.print("Card UID: ");
+    for (uint8_t i = 0; i < uidLen; i++) {
+      if (uid[i] < 0x10) Serial.print('0');
+      Serial.print(uid[i], HEX);
+      if (i < uidLen - 1) Serial.print(':');
+    }
+    Serial.printf("  (%d bytes)  SAK=0x%02X  %s\n", uidLen, sak, cardType(sak));
+    haltCard();
+    delay(1000);
+  }
+
+  if (millis() - lastBeat > 5000) {   // heartbeat so you know it is alive
+    Serial.println("...waiting for card");
+    lastBeat = millis();
+  }
+  delay(50);
+}
