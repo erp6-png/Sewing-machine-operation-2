@@ -1,0 +1,1029 @@
+// =================================================
+// ESP32 SEWING OPERATION COUNTER + RFID CARD READER
+// 1.8" ST7735 (160x128) + HW-147C (Si512 / PN512 / MFRC522-compatible)
+//
+// v2.3  R&D build
+//  - NEW: RFID card UID is read and shown on the display (row under the header).
+//      * Before the first card:  "WAITING FOR RFID"
+//      * After a card is tapped: its UID stays on screen (it does NOT go back
+//        to "waiting")
+//      * Tap a DIFFERENT card:   the UID on screen changes to the new one
+//      * Tap the SAME card again: nothing changes
+//  - STYLE moved to the top-right of the FINISHED (FG) card.
+//  - Everything from v2.2 is unchanged (FG counted on removal, MIN..MAX window,
+//    standalone mode, OTA).
+//
+// Libraries: TFT_eSPI only (OTA, Wi-Fi and SPI come with the ESP32 core)
+// Board: ESP32 Dev Module
+// Arduino IDE: Tools > Partition Scheme must have OTA
+//   ("Default 4MB with spiffs" is fine)
+// Arduino IDE needs the sketch inside a folder with the same name:
+//   sewing_counter_rfid/sewing_counter_rfid.ino
+//
+// ===== PIN MAP =====
+//  TFT (in TFT_eSPI/User_Setup.h, uses the main VSPI bus):
+//     MOSI 23   SCLK 26   CS 5   DC 16   RST 17   VCC 3.3V   LED 3.3V
+//  RFID HW-147C (separate HSPI bus, set below):
+//     SCK 14    MISO 32   MOSI 33   SS 25   VCC 3.3V (recommended)   RST/IRQ not connected
+//     Switch: SW1 = OFF, SW2 = ON (SPI mode) -> unplug USB after changing it
+//  IR sensor output   -> GPIO 19   (level for "garment present" = IR_ACTIVE_LEVEL below)
+//  NJK-5002C output   -> optocoupler -> GPIO 34 (input-only pin: add 10k
+//                        pull-up to 3.3V; idles HIGH, pulse = LOW)
+//  Buzzer             -> GPIO 22
+//  NEVER feed the 12-24 V NJK-5002C output straight into an ESP32 pin.
+//
+// OTA HOW-TO
+//  1. First upload by USB cable (this puts OTA inside the device).
+//  2. Device and PC on the same Wi-Fi. The IP shows on screen after boot.
+//  3. Arduino IDE > Tools > Port > Network ports > "M01" (or the IP).
+//  4. Upload. Password = OTA_PASSWORD below. The screen shows the progress.
+// =================================================
+
+#include <SPI.h>
+#include <TFT_eSPI.h>
+#include <WiFi.h>
+#include <ArduinoOTA.h>
+
+#define USE_SERVER 0        // 0 = standalone R&D (no server)   1 = talk to server
+
+#if USE_SERVER
+#include <HTTPClient.h>
+#endif
+
+#define FW_VERSION "2.3.0"
+
+TFT_eSPI tft = TFT_eSPI();
+TFT_eSprite spr = TFT_eSprite(&tft);
+
+#define SCR_W 160
+#define SCR_H 128
+#define SCREEN_ROTATION 3
+
+// ================= USER SETTINGS =================
+const char* WIFI_SSID  = "Joy";
+const char* WIFI_PASS  = "Subhajit#22";
+
+const char* MACHINE_ID   = "M01";            // also the OTA name
+const char* OTA_PASSWORD = "123456";         // change this
+
+// ---- Standalone job (used when USE_SERVER is 0) ----
+const char* LOCAL_STYLE = "PM666/01";
+const long  LOCAL_QTY   = 100;               // Q at start
+const int   LOCAL_N     = 50;                // MAX stitches = operation complete
+const int   LOCAL_N_MIN = 40;                // MIN stitches to accept as FG on removal
+
+// ---- Server (used when USE_SERVER is 1) ----
+const char* SERVER_URL  = "http://10.7.13.15:8502";
+const char* PATH_JOB    = "/api/v1/stitch/job";      // GET
+const char* PATH_EVENTS = "/api/v1/stitch/events";   // POST
+const char* DEVICE_KEY  = "PASTE_DEVICE_KEY";        // sent as X-Device-Key
+
+// ================= PINS =================
+const int irPin     = 19;
+const int pulsePin  = 34;
+const int buzzerPin = 22;
+const int IR_ACTIVE_LEVEL = HIGH;                     // level when garment present
+
+// ---- RFID reader pins (HSPI bus) ----
+#define PIN_RFID_SCK   14
+#define PIN_RFID_MISO  32
+#define PIN_RFID_MOSI  33
+#define PIN_RFID_SS    25
+#define PIN_RFID_RST   -1      // -1 = not connected
+#define RFID_SPI_FREQ  1000000 // 1 MHz - very safe for jumper wires
+
+// ================= TIMING =================
+const unsigned long PULSE_DEBOUNCE_US   = 30000;     // ignore pulses < 30 ms apart
+const unsigned long PRESENT_CONFIRM_MS  = 100;       // garment must be seen this long
+const unsigned long ABSENT_CONFIRM_MS   = 300;       // garment must be gone this long
+const unsigned long RENDER_INTERVAL_MS  = 150;
+const unsigned long FLASH_MS            = 2500;      // banner time
+const unsigned long WIFI_RETRY_MS       = 15000;     // retry Wi-Fi when it drops
+const unsigned long RFID_POLL_MS        = 120;       // look for a card this often
+const unsigned long RFID_RETRY_MS       = 5000;      // retry reader when it is not found
+const unsigned long NEWCARD_MS          = 1500;      // highlight time for a new card
+#if USE_SERVER
+const unsigned long SYNC_INTERVAL_MS    = 3000;
+const unsigned long IDLE_BEFORE_SYNC_MS = 1500;      // machine idle this long = safe to use network
+#endif
+
+// ================= JOB =================
+String styleNo = "";
+int    stitchN    = 50;       // MAX stitches (complete)
+int    stitchMin  = 40;       // MIN stitches (accepted as FG)
+long   qtyRemaining = 0;      // Q
+long   finishedFG   = 0;      // FG
+long   discardedCnt = 0;
+
+// ================= LIVE COUNT =================
+int  pulseCount = 0;          // stitches on the garment now under the needle
+bool garmentPresent = false;
+bool irCandidate = false;
+unsigned long irCandidateSince = 0;
+unsigned long lastPulseSeenMs = 0;
+
+// ================= RFID STATE =================
+bool          rfidOk = false;       // reader found and answering
+String        lastUid = "";         // last card UID (stays on screen)
+unsigned long newCardUntil = 0;     // highlight the row until this time
+
+// ================= OTA STATE =================
+bool otaStarted = false;
+bool otaInProgress = false;
+int  otaLastPct = -1;
+
+// ================= PULSE INTERRUPT =================
+volatile uint32_t isrPulses = 0;
+volatile uint32_t lastPulseUs = 0;
+
+void IRAM_ATTR onPulse() {
+  uint32_t now = micros();
+  if (now - lastPulseUs > PULSE_DEBOUNCE_US) {
+    isrPulses++;
+    lastPulseUs = now;
+  }
+}
+
+// ================= EVENT QUEUE (only used with a server) =================
+struct Event {
+  const char*   type;      // "OP_DONE" or "OP_DISCARD"
+  uint8_t       pulses;
+  uint32_t      seq;
+  unsigned long ms;        // millis() when it happened
+  char          style[16];
+};
+const int QUEUE_SIZE = 40;
+Event queueBuf[QUEUE_SIZE];
+int qHead = 0, qCount = 0;
+uint32_t eventSeq = 0;
+uint32_t bootId = 0;
+
+void queueEvent(const char* type, uint8_t pulses) {
+#if USE_SERVER
+  if (qCount >= QUEUE_SIZE) return;
+  Event &e = queueBuf[(qHead + qCount) % QUEUE_SIZE];
+  e.type = type;
+  e.pulses = pulses;
+  e.seq = ++eventSeq;
+  e.ms = millis();
+  strncpy(e.style, styleNo.c_str(), sizeof(e.style));
+  e.style[sizeof(e.style) - 1] = 0;
+  qCount++;
+#else
+  (void)type; (void)pulses;       // standalone: nothing to send
+#endif
+}
+
+// ================= BANNER (result flash) =================
+String        flashText = "";
+uint16_t      flashColor = TFT_GREEN;
+unsigned long flashUntil = 0;
+
+void flash(const String &t, uint16_t col) {
+  flashText = t;
+  flashColor = col;
+  flashUntil = millis() + FLASH_MS;
+}
+
+// ================= BUZZER =================
+void beep(int times) {
+  for (int i = 0; i < times; i++) {
+    digitalWrite(buzzerPin, HIGH); delay(70);
+    digitalWrite(buzzerPin, LOW);  delay(70);
+  }
+}
+
+// =================================================
+// RFID READER (HW-147C over its own SPI bus)
+// =================================================
+// ---- Registers ----
+#define CommandReg     0x01
+#define ComIrqReg      0x04
+#define DivIrqReg      0x05
+#define ErrorReg       0x06
+#define FIFODataReg    0x09
+#define FIFOLevelReg   0x0A
+#define ControlReg     0x0C
+#define BitFramingReg  0x0D
+#define CollReg        0x0E
+#define ModeReg        0x11
+#define TxControlReg   0x14
+#define TxASKReg       0x15
+#define CRCResultRegH  0x21
+#define CRCResultRegL  0x22
+#define RFCfgReg       0x26
+#define TModeReg       0x2A
+#define TPrescalerReg  0x2B
+#define TReloadRegH    0x2C
+#define TReloadRegL    0x2D
+#define VersionReg     0x37
+
+// ---- Commands ----
+#define RC_CMD_IDLE       0x00
+#define RC_CMD_CALCCRC    0x03
+#define RC_CMD_TRANSCEIVE 0x0C
+#define RC_CMD_SOFTRESET  0x0F
+
+enum RfStatus { RF_OK, RF_TIMEOUT, RF_ERROR, RF_NOROOM };
+
+SPIClass    rfidSPI(HSPI);
+SPISettings rfidSettings(RFID_SPI_FREQ, MSBFIRST, SPI_MODE0);
+
+// VersionReg values of the chips supported:
+//   0xB2 = Si512 (HW-147C)   0x82 = PN512   0x91/0x92 = MFRC522
+bool isKnownVersion(uint8_t v) {
+  return v == 0xB2 || v == 0x82 || v == 0x91 || v == 0x92;
+}
+
+const char *chipName(uint8_t v) {
+  switch (v) {
+    case 0xB2: return "Si512";
+    case 0x82: return "PN512";
+    case 0x91: return "MFRC522 v1.0";
+    case 0x92: return "MFRC522 v2.0";
+    default:   return "Unknown";
+  }
+}
+
+// Address byte: write = (reg << 1) & 0x7E, read = 0x80 | (reg << 1)
+void writeReg(uint8_t reg, uint8_t val) {
+  rfidSPI.beginTransaction(rfidSettings);
+  digitalWrite(PIN_RFID_SS, LOW);
+  delayMicroseconds(2);
+  rfidSPI.transfer((reg << 1) & 0x7E);
+  rfidSPI.transfer(val);
+  delayMicroseconds(2);
+  digitalWrite(PIN_RFID_SS, HIGH);
+  rfidSPI.endTransaction();
+}
+
+uint8_t readReg(uint8_t reg) {
+  rfidSPI.beginTransaction(rfidSettings);
+  digitalWrite(PIN_RFID_SS, LOW);
+  delayMicroseconds(2);
+  rfidSPI.transfer(0x80 | ((reg << 1) & 0x7E));
+  uint8_t val = rfidSPI.transfer(0x00);
+  delayMicroseconds(2);
+  digitalWrite(PIN_RFID_SS, HIGH);
+  rfidSPI.endTransaction();
+  return val;
+}
+
+void setBits(uint8_t reg, uint8_t mask)   { writeReg(reg, readReg(reg) | mask); }
+void clearBits(uint8_t reg, uint8_t mask) { writeReg(reg, readReg(reg) & ~mask); }
+
+void resetReader() {
+  if (PIN_RFID_RST >= 0) {            // hard reset only if RST is wired
+    digitalWrite(PIN_RFID_RST, LOW);
+    delay(10);
+    digitalWrite(PIN_RFID_RST, HIGH);
+    delay(50);
+  }
+  writeReg(CommandReg, RC_CMD_SOFTRESET);   // soft reset always
+  delay(50);
+}
+
+// CRC by the chip coprocessor
+bool calcCRC(const uint8_t *data, uint8_t len, uint8_t *out) {
+  writeReg(CommandReg, RC_CMD_IDLE);
+  writeReg(DivIrqReg, 0x04);          // clear CRCIRq
+  writeReg(FIFOLevelReg, 0x80);       // flush FIFO
+  for (uint8_t i = 0; i < len; i++) writeReg(FIFODataReg, data[i]);
+  writeReg(CommandReg, RC_CMD_CALCCRC);
+
+  uint32_t t = millis();
+  while (millis() - t < 50) {
+    if (readReg(DivIrqReg) & 0x04) {
+      writeReg(CommandReg, RC_CMD_IDLE);
+      out[0] = readReg(CRCResultRegL);
+      out[1] = readReg(CRCResultRegH);
+      return true;
+    }
+  }
+  return false;
+}
+
+// Send / receive to card
+RfStatus transceive(const uint8_t *send, uint8_t sendLen,
+                    uint8_t *back, uint8_t *backLen, uint8_t txLastBits = 0) {
+  writeReg(CommandReg, RC_CMD_IDLE);
+  writeReg(ComIrqReg, 0x7F);          // clear all IRQ flags
+  writeReg(FIFOLevelReg, 0x80);       // flush FIFO
+  for (uint8_t i = 0; i < sendLen; i++) writeReg(FIFODataReg, send[i]);
+  writeReg(BitFramingReg, txLastBits);
+  writeReg(CommandReg, RC_CMD_TRANSCEIVE);
+  setBits(BitFramingReg, 0x80);       // StartSend
+
+  bool done = false;
+  uint32_t t = millis();
+  while (millis() - t < 50) {
+    uint8_t irq = readReg(ComIrqReg);
+    if (irq & 0x30) { done = true; break; }   // RxIRq or IdleIRq
+    if (irq & 0x01) break;                    // TimerIRq = no card answer
+  }
+  clearBits(BitFramingReg, 0x80);
+  if (!done) return RF_TIMEOUT;
+
+  if (readReg(ErrorReg) & 0x1B) return RF_ERROR;  // buffer/collision/parity/protocol
+
+  uint8_t n = readReg(FIFOLevelReg);
+  if (n > *backLen) return RF_NOROOM;
+  *backLen = n;
+  for (uint8_t i = 0; i < n; i++) back[i] = readReg(FIFODataReg);
+  return RF_OK;
+}
+
+void initReader() {
+  writeReg(TModeReg, 0x80);       // timer auto-start after transmit
+  writeReg(TPrescalerReg, 0xA9);  // ~40 kHz timer
+  writeReg(TReloadRegH, 0x03);    // ~25 ms timeout
+  writeReg(TReloadRegL, 0xE8);
+  writeReg(TxASKReg, 0x40);       // 100% ASK modulation
+  writeReg(ModeReg, 0x3D);        // CRC preset 0x6363
+  writeReg(ControlReg, 0x10);     // Initiator (reader) mode - needed on PN512/Si512
+  writeReg(RFCfgReg, 0x70);       // max receiver gain
+  setBits(TxControlReg, 0x03);    // antenna ON (TX1 + TX2)
+}
+
+void explainVersion(uint8_t v) {
+  if (v == 0x00)      Serial.println("    -> 0x00: MISO held LOW. Check reader power, RST not pulled low, MISO not on GND.");
+  else if (v == 0xFF) Serial.println("    -> 0xFF: MISO floating. Check switch = SPI + USB unplugged, SS wire, side header soldered.");
+  else                Serial.println("    -> Other value: SCK/MOSI may be swapped, or noisy wires.");
+}
+
+// Reset + check version + init, with retries
+bool connectReader(int attempts, bool verbose) {
+  for (int i = 1; i <= attempts; i++) {
+    resetReader();
+    uint8_t v = readReg(VersionReg);
+    if (isKnownVersion(v)) {
+      initReader();
+      if (verbose) Serial.printf("RFID reader found. VersionReg = 0x%02X (%s)\n", v, chipName(v));
+      return true;
+    }
+    if (verbose) {
+      Serial.printf("  RFID attempt %d: VersionReg = 0x%02X (expected 0xB2 Si512 / 0x82 PN512)\n", i, v);
+      if (i == 1) explainVersion(v);
+    }
+    if (i < attempts) delay(200);
+  }
+  return false;
+}
+
+// Read card UID (4, 7 or 10 bytes)
+bool readCardUID(uint8_t *uid, uint8_t &uidLen, uint8_t &sak) {
+  uint8_t buf[5];
+  uint8_t len = 2;
+  uint8_t reqa = 0x26;
+
+  clearBits(CollReg, 0x80);
+  if (transceive(&reqa, 1, buf, &len, 0x07) != RF_OK || len != 2) return false;  // ATQA
+
+  const uint8_t selCodes[3] = {0x93, 0x95, 0x97};
+  uidLen = 0;
+
+  for (uint8_t level = 0; level < 3; level++) {
+    uint8_t anti[2] = {selCodes[level], 0x20};
+    len = 5;
+    if (transceive(anti, 2, buf, &len) != RF_OK || len != 5) return false;
+    if ((buf[0] ^ buf[1] ^ buf[2] ^ buf[3]) != buf[4]) return false;   // BCC check
+
+    uint8_t sel[9] = {selCodes[level], 0x70, buf[0], buf[1], buf[2], buf[3], buf[4]};
+    if (!calcCRC(sel, 7, &sel[7])) return false;
+    uint8_t sakBuf[3];
+    len = 3;
+    if (transceive(sel, 9, sakBuf, &len) != RF_OK || len != 3) return false;
+    sak = sakBuf[0];
+
+    if (buf[0] == 0x88) {             // cascade tag: 3 real UID bytes
+      memcpy(&uid[uidLen], &buf[1], 3);
+      uidLen += 3;
+    } else {
+      memcpy(&uid[uidLen], buf, 4);
+      uidLen += 4;
+    }
+    if (!(sak & 0x04)) return true;   // UID complete
+  }
+  return false;
+}
+
+// Put card to sleep (one tap = one read; card must leave the field to be read again)
+void haltCard() {
+  uint8_t hlt[4] = {0x50, 0x00};
+  calcCRC(hlt, 2, &hlt[2]);
+  uint8_t dummy[2];
+  uint8_t len = sizeof(dummy);
+  transceive(hlt, 4, dummy, &len);    // no answer expected
+}
+
+String uidToString(const uint8_t *uid, uint8_t len) {
+  String s = "";
+  char b[4];
+  for (uint8_t i = 0; i < len; i++) {
+    snprintf(b, sizeof(b), "%02X", uid[i]);
+    s += b;
+    if (i < len - 1) s += ":";
+  }
+  return s;
+}
+
+void render();   // forward declaration
+
+// Called from loop(): finds cards, keeps the reader healthy, never blocks for long
+void pollRfid() {
+  static unsigned long lastPoll = 0, lastHealth = 0, lastRetry = 0;
+  unsigned long now = millis();
+
+  if (!rfidOk) {                                   // reader missing: retry now and then
+    if (now - lastRetry >= RFID_RETRY_MS) {
+      lastRetry = now;
+      rfidOk = connectReader(1, false);
+      if (rfidOk) { Serial.println("RFID reader connected."); render(); }
+    }
+    return;
+  }
+
+  if (now - lastHealth >= 2000) {                  // health check every 2 s
+    lastHealth = now;
+    if (!isKnownVersion(readReg(VersionReg))) {
+      rfidOk = false;
+      lastRetry = now;
+      Serial.println("RFID reader lost - will retry.");
+      render();
+      return;
+    }
+  }
+
+  if (now - lastPoll < RFID_POLL_MS) return;
+  lastPoll = now;
+
+  uint8_t uid[10];
+  uint8_t uidLen = 0, sak = 0;
+  if (readCardUID(uid, uidLen, sak)) {
+    String s = uidToString(uid, uidLen);
+    haltCard();
+    if (s != lastUid) {                            // new / different card
+      lastUid = s;
+      newCardUntil = millis() + NEWCARD_MS;
+      Serial.printf("CARD UID: %s  (%d bytes)  SAK=0x%02X\n", s.c_str(), uidLen, sak);
+      beep(1);
+      render();
+    }
+    // same card tapped again: nothing changes
+  }
+}
+
+// =================================================
+// DRAWING
+// =================================================
+int wifiBars() {
+  if (WiFi.status() != WL_CONNECTED) return -1;
+  long rssi = WiFi.RSSI();
+  if (rssi > -55) return 4;
+  if (rssi > -65) return 3;
+  if (rssi > -75) return 2;
+  if (rssi > -85) return 1;
+  return 0;
+}
+
+void drawWiFiBars(int x, int yb) {
+  int bars = wifiBars();
+  for (int i = 0; i < 4; i++) {
+    int h = 3 + i * 3;
+    uint16_t col = (bars > i) ? TFT_GREEN : TFT_DARKGREY;
+    spr.fillRect(x + i * 4, yb - h + 1, 3, h, col);
+  }
+  if (bars < 0) {
+    spr.drawLine(x, yb - 11, x + 14, yb, TFT_RED);
+    spr.drawLine(x, yb, x + 14, yb - 11, TFT_RED);
+  }
+}
+
+// Draw left-aligned text in the bigger font if it fits, else the small font
+void drawFit(const String &s, int x, int y, int maxW, uint16_t col) {
+  spr.setTextDatum(ML_DATUM);
+  spr.setTextColor(col);
+  int f = (spr.textWidth(s, 2) <= maxW) ? 2 : 1;
+  spr.drawString(s, x, y, f);
+}
+
+void drawBox(int x, int y, int w, int h, const char* label,
+             long value, uint16_t col, bool active) {
+  spr.fillRoundRect(x, y, w, h, 4, active ? col : 0x18E3);
+  spr.drawRoundRect(x, y, w, h, 4, col);
+  spr.fillRect(x + 2, y + 2, w - 4, 10, active ? TFT_WHITE : col);
+
+  spr.setTextDatum(MC_DATUM);
+  spr.setTextColor(TFT_BLACK);
+  spr.drawString(label, x + w / 2, y + 7, 1);
+
+  char buf[12];
+  snprintf(buf, sizeof(buf), "%ld", value);
+  int cy = y + h - 4;
+  spr.setTextDatum(C_BASELINE);
+  spr.setTextColor(active ? TFT_BLACK : col);
+  spr.setFreeFont(&FreeSansBold12pt7b);
+  if (spr.textWidth(buf) <= w - 6) {
+    spr.drawString(buf, x + w / 2, cy);
+  } else {
+    spr.setTextFont(2);
+    spr.drawString(buf, x + w / 2, cy);
+  }
+  spr.setTextFont(1);
+}
+
+void render() {
+  if (otaInProgress) return;                 // OTA screen owns the display
+  spr.fillSprite(TFT_BLACK);
+  char buf[24];
+  bool flashing = (flashText.length() > 0 && millis() < flashUntil);
+  bool hasJob = (styleNo.length() > 0);
+
+  // ===== HEADER =====
+  spr.fillRect(0, 0, SCR_W, 18, TFT_NAVY);
+  spr.setTextDatum(ML_DATUM);
+  spr.setTextColor(TFT_SILVER);
+  spr.drawString("MC", 3, 9, 1);
+  spr.setTextColor(TFT_WHITE);
+  spr.drawString(MACHINE_ID, 20, 9, 2);
+
+  const char* gtxt = garmentPresent ? "FABRIC" : "NO FABRIC";
+  int pw = spr.textWidth(gtxt, 1) + 10;
+  int px = SCR_W - pw - 3;
+  spr.fillRoundRect(px, 3, pw, 12, 6, garmentPresent ? TFT_GREEN : TFT_YELLOW);
+  spr.setTextDatum(MC_DATUM);
+  spr.setTextColor(TFT_BLACK);
+  spr.drawString(gtxt, px + pw / 2, 9, 1);
+  drawWiFiBars(px - 20, 15);
+
+  // ===== RFID CARD ROW =====
+  bool newCard = (millis() < newCardUntil);
+  if (newCard) spr.fillRoundRect(1, 19, SCR_W - 2, 13, 3, TFT_DARKGREEN);
+  if (!rfidOk) {
+    drawFit("RFID NOT FOUND", 3, 26, SCR_W - 6, TFT_RED);
+  } else if (lastUid.length() == 0) {
+    drawFit("WAITING FOR RFID", 3, 26, SCR_W - 6, TFT_YELLOW);
+  } else {
+    spr.setTextDatum(ML_DATUM);
+    spr.setTextColor(newCard ? TFT_WHITE : TFT_SILVER);
+    spr.drawString("CARD", 3, 26, 1);
+    drawFit(lastUid, 30, 26, SCR_W - 33, newCard ? TFT_WHITE : TFT_ORANGE);
+  }
+  if (qCount > 0) spr.fillCircle(SCR_W - 6, 25, 3, TFT_ORANGE);   // events waiting to upload
+
+  // ===== BIG CARD: FINISHED (FG) =====
+  uint16_t border = flashing ? flashColor : TFT_GREEN;
+  spr.fillRoundRect(2, 33, SCR_W - 4, 46, 6, 0x0180);              // dark green card
+  spr.drawRoundRect(2, 33, SCR_W - 4, 46, 6, border);
+  spr.drawRoundRect(3, 34, SCR_W - 6, 44, 5, border);
+
+  spr.setTextDatum(ML_DATUM);
+  spr.setTextColor(TFT_GREEN);
+  spr.drawString("FINISHED (FG)", 8, 40, 1);
+
+  spr.setTextDatum(MR_DATUM);                                      // style, top-right of the card
+  spr.setTextColor(TFT_ORANGE);
+  spr.drawString(hasJob ? styleNo : String("-"), SCR_W - 8, 40, 1);
+
+  snprintf(buf, sizeof(buf), "%ld", finishedFG);
+  spr.setTextDatum(C_BASELINE);
+  spr.setTextColor(TFT_WHITE);
+  spr.setFreeFont(&FreeSansBold24pt7b);
+  if (spr.textWidth(buf) > SCR_W - 16) spr.setFreeFont(&FreeSansBold18pt7b);
+  spr.drawString(buf, SCR_W / 2, 72);
+  spr.setTextFont(1);
+
+  // ===== STATUS STRIP =====
+  int sy = 81, sh = 13;
+  spr.setTextDatum(MC_DATUM);
+  if (flashing) {
+    spr.fillRoundRect(2, sy, SCR_W - 4, sh, 4, flashColor);
+    spr.setTextColor(TFT_BLACK);
+    spr.drawString(flashText, SCR_W / 2, sy + sh / 2 + 1, 1);
+  } else if (!hasJob) {
+    spr.fillRoundRect(2, sy, SCR_W - 4, sh, 4, 0x18E3);
+    spr.setTextColor(TFT_SILVER);
+    spr.drawString("WAITING FOR JOB", SCR_W / 2, sy + sh / 2 + 1, 1);
+  } else if (qtyRemaining <= 0 && pulseCount == 0) {
+    spr.fillRoundRect(2, sy, SCR_W - 4, sh, 4, TFT_GREEN);
+    spr.setTextColor(TFT_BLACK);
+    spr.drawString("JOB DONE", SCR_W / 2, sy + sh / 2 + 1, 1);
+  } else if (garmentPresent && pulseCount >= stitchN) {
+    // reached MAX: tell operator to remove (FG counts on removal)
+    spr.fillRoundRect(2, sy, SCR_W - 4, sh, 4, TFT_GREEN);
+    spr.setTextColor(TFT_BLACK);
+    snprintf(buf, sizeof(buf), "COMPLETE %d - REMOVE", pulseCount);
+    spr.drawString(buf, SCR_W / 2, sy + sh / 2 + 1, 1);
+  } else if (garmentPresent) {
+    // progress bar: dark green below MIN, bright green once MIN reached
+    bool okZone = (pulseCount >= stitchMin);
+    spr.fillRoundRect(2, sy, SCR_W - 4, sh, 4, 0x18E3);
+    int fillW = (SCR_W - 8) * min(pulseCount, stitchN) / max(stitchN, 1);
+    if (fillW > 0) spr.fillRoundRect(4, sy + 2, fillW, sh - 4, 2, okZone ? 0x07E0 : 0x03A0);
+    int minX = 4 + (SCR_W - 8) * stitchMin / max(stitchN, 1);       // MIN marker
+    spr.drawFastVLine(minX, sy + 1, sh - 2, TFT_YELLOW);
+    spr.setTextColor(okZone ? TFT_BLACK : TFT_WHITE);
+    if (okZone) snprintf(buf, sizeof(buf), "STITCH %d/%d  OK", pulseCount, stitchN);
+    else        snprintf(buf, sizeof(buf), "STITCH %d/%d MIN %d", pulseCount, stitchN, stitchMin);
+    spr.drawString(buf, SCR_W / 2, sy + sh / 2 + 1, 1);
+  } else {
+    spr.fillRoundRect(2, sy, SCR_W - 4, sh, 4, 0x18E3);
+    spr.setTextColor(TFT_YELLOW);
+    spr.drawString("PLACE GARMENT", SCR_W / 2, sy + sh / 2 + 1, 1);
+  }
+
+  // ===== COUNT BOXES: QTY / DISC / N =====
+  int by = 95, bh = SCR_H - by, gap = 2;
+  int bw = (SCR_W - 2 * gap) / 3;
+  drawBox(0,              by, bw, bh, "QTY",  hasJob ? qtyRemaining : 0, TFT_CYAN,
+          flashing && flashColor == TFT_GREEN);
+  drawBox(bw + gap,       by, bw, bh, "DISC", discardedCnt, TFT_RED,
+          flashing && flashColor == TFT_RED);
+  drawBox(2 * (bw + gap), by, bw, bh, "N",    stitchN,      TFT_YELLOW, false);
+
+  spr.pushSprite(0, 0);
+}
+
+// =================================================
+// SENSORS / COUNTING
+// =================================================
+// Decision is made ONLY here, when the garment leaves the machine
+void onGarmentRemoved() {
+  if (pulseCount >= stitchMin && qtyRemaining > 0) {
+    // 40..50 (or more) stitches -> good piece
+    finishedFG++;
+    qtyRemaining--;
+    queueEvent("OP_DONE", (uint8_t)min(pulseCount, 255));
+    flash("FG +1   (" + String(pulseCount) + " ST)", TFT_GREEN);
+    Serial.printf("FG COUNTED at %d st  Q=%ld FG=%ld\n", pulseCount, qtyRemaining, finishedFG);
+    beep(1);
+  } else if (pulseCount > 0 && pulseCount < stitchMin) {
+    // removed too early -> discard
+    discardedCnt++;
+    queueEvent("OP_DISCARD", (uint8_t)pulseCount);
+    flash("DISCARDED " + String(pulseCount) + "/" + String(stitchMin), TFT_RED);
+    Serial.printf("DISCARDED at %d (min %d)  DISC=%ld\n", pulseCount, stitchMin, discardedCnt);
+    beep(2);
+  }
+  pulseCount = 0;
+  render();
+}
+
+void readGarmentSensor() {
+  bool raw = (digitalRead(irPin) == IR_ACTIVE_LEVEL);
+  if (raw != irCandidate) {                 // changed: start timing
+    irCandidate = raw;
+    irCandidateSince = millis();
+    return;
+  }
+  if (raw == garmentPresent) return;
+
+  unsigned long needed = raw ? PRESENT_CONFIRM_MS : ABSENT_CONFIRM_MS;
+  if (millis() - irCandidateSince >= needed) {
+    garmentPresent = raw;
+    if (!garmentPresent) onGarmentRemoved();
+    else render();
+  }
+}
+
+void processPulses() {
+  noInterrupts();
+  uint32_t n = isrPulses;
+  isrPulses = 0;
+  interrupts();
+  if (n == 0) return;
+  lastPulseSeenMs = millis();
+
+  bool changed = false;
+  while (n--) {
+    if (garmentPresent && qtyRemaining > 0 && styleNo.length() > 0) {
+      if (pulseCount < 255) pulseCount++;   // stitches beyond MAX still same garment
+      changed = true;
+      if (pulseCount == stitchN) {          // reached MAX: only a signal, no FG yet
+        Serial.printf("COMPLETE %d/%d - waiting for removal\n", pulseCount, stitchN);
+        beep(1);
+      }
+    }
+    // no garment / no job: pulse ignored
+  }
+  if (changed) render();
+}
+
+// =================================================
+// WIFI
+// =================================================
+void connectWiFi(unsigned long timeoutMs) {
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  unsigned long t = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t < timeoutMs) delay(200);
+}
+
+// Non-blocking: if Wi-Fi dropped, ask the radio to reconnect now and then
+void keepWiFiAlive() {
+  static unsigned long lastTry = 0;
+  if (WiFi.status() == WL_CONNECTED) return;
+  if (millis() - lastTry < WIFI_RETRY_MS) return;
+  lastTry = millis();
+  Serial.printf("WiFi not connected - retrying \"%s\"...\n", WIFI_SSID);
+  WiFi.disconnect();
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+}
+
+// =================================================
+// OTA
+// =================================================
+void drawOtaScreen(int pct, unsigned int done, unsigned int total,
+                   const String &msg, uint16_t headCol, bool error) {
+  spr.fillSprite(TFT_BLACK);
+  spr.fillRect(0, 0, SCR_W, 18, headCol);
+  spr.setTextDatum(MC_DATUM);
+  spr.setTextColor(TFT_WHITE);
+  spr.drawString("FIRMWARE UPDATE", SCR_W / 2, 9, 2);
+  spr.setTextColor(TFT_SILVER);
+  spr.drawString(MACHINE_ID, SCR_W / 2, 26, 1);
+
+  if (error) {
+    spr.setTextColor(TFT_RED);
+    spr.drawString("UPDATE FAILED", SCR_W / 2, 52, 2);
+    spr.setTextColor(TFT_WHITE);
+    spr.drawString(msg, SCR_W / 2, 74, 1);
+    spr.setTextColor(TFT_SILVER);
+    spr.drawString("OLD FIRMWARE KEPT", SCR_W / 2, 92, 1);
+    spr.setTextColor(TFT_DARKGREY);
+    spr.drawString("FW " FW_VERSION, SCR_W / 2, 122, 1);
+    spr.pushSprite(0, 0);
+    return;
+  }
+
+  char buf[8];
+  snprintf(buf, sizeof(buf), "%d%%", pct);
+  spr.setTextDatum(C_BASELINE);
+  spr.setTextColor(pct >= 100 ? TFT_GREEN : TFT_WHITE);
+  spr.setFreeFont(&FreeSansBold18pt7b);
+  spr.drawString(buf, SCR_W / 2, 68);
+  spr.setTextFont(1);
+
+  int bx = 8, by = 76, bw = SCR_W - 16, bh = 12;
+  uint16_t barCol = (pct >= 100) ? TFT_GREEN : TFT_CYAN;
+  spr.drawRoundRect(bx, by, bw, bh, 3, barCol);
+  int fill = (bw - 4) * pct / 100;
+  if (fill > 0) spr.fillRoundRect(bx + 2, by + 2, fill, bh - 4, 2, barCol);
+
+  spr.setTextDatum(MC_DATUM);
+  spr.setTextColor(TFT_SILVER);
+  if (total > 0)
+    spr.drawString(String(done / 1024) + " / " + String(total / 1024) + " KB", SCR_W / 2, 98, 1);
+
+  spr.setTextColor(pct >= 100 ? TFT_GREEN : TFT_ORANGE);
+  spr.drawString(msg, SCR_W / 2, 111, 1);
+  spr.setTextColor(TFT_DARKGREY);
+  spr.drawString("FW " FW_VERSION, SCR_W / 2, 122, 1);
+  spr.pushSprite(0, 0);
+}
+
+String otaErrorText(ota_error_t e) {
+  if (e == OTA_AUTH_ERROR)    return "WRONG OTA PASSWORD";
+  if (e == OTA_BEGIN_ERROR)   return "NO SPACE / PARTITION";
+  if (e == OTA_CONNECT_ERROR) return "PC CONNECT FAILED";
+  if (e == OTA_RECEIVE_ERROR) return "DATA LOST - RETRY";
+  if (e == OTA_END_ERROR)     return "VERIFY FAILED";
+  return "ERROR " + String((int)e);
+}
+
+void startOTA() {
+  ArduinoOTA.setHostname(MACHINE_ID);
+  ArduinoOTA.setPassword(OTA_PASSWORD);
+
+  ArduinoOTA.onStart([]() {
+    otaInProgress = true;
+    otaLastPct = -1;
+    digitalWrite(buzzerPin, LOW);
+    drawOtaScreen(0, 0, 0, "DO NOT POWER OFF", TFT_NAVY, false);
+  });
+  ArduinoOTA.onProgress([](unsigned int done, unsigned int total) {
+    int pct = total ? (int)((uint64_t)done * 100 / total) : 0;
+    if (pct != otaLastPct) {
+      otaLastPct = pct;
+      drawOtaScreen(pct, done, total, "DO NOT POWER OFF", TFT_NAVY, false);
+    }
+  });
+  ArduinoOTA.onEnd([]() {
+    drawOtaScreen(100, 0, 0, "DONE - RESTARTING...", TFT_DARKGREEN, false);
+    delay(1500);
+  });
+  ArduinoOTA.onError([](ota_error_t e) {
+    drawOtaScreen(0, 0, 0, otaErrorText(e), TFT_RED, true);
+    delay(3000);
+    otaInProgress = false;                   // back to the counter screen
+    render();
+  });
+
+  ArduinoOTA.begin();
+  otaStarted = true;
+  flash("OTA READY " + WiFi.localIP().toString(), TFT_CYAN);
+  Serial.printf("OTA READY: name %s  IP %s\n", MACHINE_ID, WiFi.localIP().toString().c_str());
+}
+
+// Start OTA as soon as Wi-Fi is up (boot or later reconnect)
+void manageOTA() {
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!otaStarted) startOTA();
+    ArduinoOTA.handle();
+  } else if (otaStarted) {
+    ArduinoOTA.end();                        // link lost: restart OTA after reconnect
+    otaStarted = false;
+  }
+}
+
+// =================================================
+// SERVER (compiled only when USE_SERVER is 1)
+// =================================================
+#if USE_SERVER
+String jsonStr(const String &js, const char* key) {
+  String k = String("\"") + key + "\":";
+  int p = js.indexOf(k);
+  if (p < 0) return "";
+  p += k.length();
+  while (p < (int)js.length() && js[p] == ' ') p++;
+  if (p >= (int)js.length() || js[p] != '"') return "";
+  int e = js.indexOf('"', p + 1);
+  if (e < 0) return "";
+  return js.substring(p + 1, e);
+}
+
+bool jsonInt(const String &js, const char* key, long &out) {
+  String k = String("\"") + key + "\":";
+  int p = js.indexOf(k);
+  if (p < 0) return false;
+  p += k.length();
+  while (p < (int)js.length() && js[p] == ' ') p++;
+  out = js.substring(p).toInt();
+  return true;
+}
+
+// POST the oldest queued event ("age_s" = seconds ago, so the server can
+// work out the real time even if the event waited offline)
+void sendOneEvent() {
+  Event &e = queueBuf[qHead];
+  char id[48];
+  snprintf(id, sizeof(id), "%s-%08lX-%lu", MACHINE_ID, (unsigned long)bootId, (unsigned long)e.seq);
+
+  String body = String("{\"device_id\":\"") + MACHINE_ID +
+                "\",\"events\":[{\"client_event_id\":\"" + id +
+                "\",\"event_type\":\"" + e.type +
+                "\",\"style_no\":\"" + e.style +
+                "\",\"pulses\":" + String(e.pulses) +
+                ",\"age_s\":" + String((millis() - e.ms) / 1000) + "}]}";
+
+  HTTPClient http;
+  http.setConnectTimeout(3000);
+  http.setTimeout(3000);
+  http.begin(String(SERVER_URL) + PATH_EVENTS);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("X-Device-Key", DEVICE_KEY);
+  int code = http.POST(body);
+  http.end();
+
+  if ((code >= 200 && code < 300) || code == 409) {   // 409 = already stored
+    qHead = (qHead + 1) % QUEUE_SIZE;
+    qCount--;
+  }
+}
+
+// Reply expected: {"style_no":"PM666/01","q":100,"fg":0,"n":50,"n_min":40}
+void fetchJob() {
+  HTTPClient http;
+  http.setConnectTimeout(3000);
+  http.setTimeout(3000);
+  http.begin(String(SERVER_URL) + PATH_JOB + "?machine=" + MACHINE_ID);
+  http.addHeader("X-Device-Key", DEVICE_KEY);
+  int code = http.GET();
+  if (code != 200) { http.end(); return; }
+  String r = http.getString();
+  http.end();
+
+  String s = jsonStr(r, "style_no");
+  long q, fg, n, nMin;
+  if (!jsonInt(r, "q", q) || !jsonInt(r, "fg", fg)) return;
+
+  if (s != styleNo) {                       // new job
+    styleNo = s;
+    pulseCount = 0;
+    discardedCnt = 0;
+  }
+  if (jsonInt(r, "n", n) && n >= 1 && n <= 200) stitchN = (int)n;
+  if (jsonInt(r, "n_min", nMin) && nMin >= 1 && nMin <= stitchN) stitchMin = (int)nMin;
+  if (stitchMin > stitchN) stitchMin = stitchN;
+  qtyRemaining = q;                         // server is master for Q and FG
+  finishedFG   = fg;
+  render();
+}
+
+void syncWithServer() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (qCount > 0) sendOneEvent();
+  else            fetchJob();
+}
+#endif
+
+// =================================================
+void setup() {
+  Serial.begin(115200);
+  pinMode(irPin, INPUT);
+  pinMode(pulsePin, INPUT);            // GPIO34: external 10k pull-up to 3.3V
+  pinMode(buzzerPin, OUTPUT);
+  digitalWrite(buzzerPin, LOW);
+  attachInterrupt(digitalPinToInterrupt(pulsePin), onPulse, FALLING);
+
+  // RFID chip-select idle HIGH before anything else talks on the bus
+  pinMode(PIN_RFID_SS, OUTPUT);
+  digitalWrite(PIN_RFID_SS, HIGH);
+  if (PIN_RFID_RST >= 0) {
+    pinMode(PIN_RFID_RST, OUTPUT);
+    digitalWrite(PIN_RFID_RST, HIGH);
+  }
+
+  tft.init();
+  tft.setRotation(SCREEN_ROTATION);
+  tft.fillScreen(TFT_BLACK);
+  spr.createSprite(SCR_W, SCR_H);
+
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString("SEWING COUNTER", SCR_W / 2, 40, 2);
+  tft.drawString("FW " FW_VERSION, SCR_W / 2, 65, 1);
+  tft.drawString("Starting RFID...", SCR_W / 2, 85, 1);
+
+  Serial.println();
+  Serial.printf("=== Sewing Counter + RFID FW %s  ID %s ===\n", FW_VERSION, MACHINE_ID);
+
+  // RFID reader on its own HSPI bus (SS driven by hand, so pass -1 here)
+  delay(100);                          // let the reader power up
+  rfidSPI.begin(PIN_RFID_SCK, PIN_RFID_MISO, PIN_RFID_MOSI, -1);
+  rfidOk = connectReader(3, true);
+  if (!rfidOk) Serial.println("RFID reader not found - counter keeps running, will retry every 5 s.");
+
+  tft.drawString("Connecting Wi-Fi...", SCR_W / 2, 100, 1);
+  bootId = esp_random();
+  connectWiFi(8000);
+
+  Serial.printf("Mode: %s\n", USE_SERVER ? "SERVER" : "STANDALONE (no server)");
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("WiFi OK: %s  IP %s  RSSI %d dBm\n", WIFI_SSID,
+                  WiFi.localIP().toString().c_str(), (int)WiFi.RSSI());
+  } else {
+    Serial.printf("WiFi NOT connected to \"%s\" - check name/password (2.4 GHz only). Will keep retrying.\n", WIFI_SSID);
+  }
+
+#if !USE_SERVER
+  styleNo      = LOCAL_STYLE;          // standalone job
+  qtyRemaining = LOCAL_QTY;
+  stitchN      = LOCAL_N;
+  stitchMin    = min(LOCAL_N_MIN, LOCAL_N);
+#endif
+
+  irCandidate = (digitalRead(irPin) == IR_ACTIVE_LEVEL);
+  garmentPresent = irCandidate;
+  render();
+}
+
+void loop() {
+  manageOTA();
+  if (otaInProgress) return;           // do nothing else while updating
+
+  readGarmentSensor();
+  processPulses();
+  pollRfid();
+  keepWiFiAlive();
+
+#if USE_SERVER
+  // Use the network only when the machine is idle (a slow request must never
+  // delay garment detection in the middle of stitching)
+  static unsigned long lastSync = 0;
+  bool safeToSync = !garmentPresent || (millis() - lastPulseSeenMs > IDLE_BEFORE_SYNC_MS);
+  if (safeToSync && millis() - lastSync >= SYNC_INTERVAL_MS) {
+    lastSync = millis();
+    syncWithServer();
+  }
+#endif
+
+  static unsigned long lastRender = 0;
+  if (millis() - lastRender >= RENDER_INTERVAL_MS) {
+    lastRender = millis();
+    render();
+  }
+
+  // Serial status every 2 s (open Serial Monitor at 115200)
+  static unsigned long lastDebug = 0;
+  if (millis() - lastDebug >= 2000) {
+    lastDebug = millis();
+    Serial.printf("IR=%d GARMENT=%s PULSE_PIN=%d  %d (min %d / max %d)  Q=%ld FG=%ld DISC=%ld  RFID=%s UID=%s  WIFI=%s\n",
+                  digitalRead(irPin), garmentPresent ? "PRESENT" : "ABSENT",
+                  digitalRead(pulsePin), pulseCount, stitchMin, stitchN,
+                  qtyRemaining, finishedFG, discardedCnt,
+                  rfidOk ? "OK" : "MISSING", lastUid.length() ? lastUid.c_str() : "-",
+                  WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : "OFFLINE");
+  }
+}
