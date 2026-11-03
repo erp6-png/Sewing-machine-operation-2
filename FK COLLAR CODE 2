@@ -1,0 +1,1312 @@
+/*
+  =====================================================================
+   MACHINE MONITOR - UNIVERSAL FIRMWARE  v2.0.0
+   ESP32 + W5500 LAN + NJK-5002C sensor + LM2596
+  =====================================================================
+   ONE .bin FOR EVERY MACHINE
+   - No Device ID, key, MAC or IP is written in this code.
+   - Every board has its own HW ID (factory MAC of the ESP32 chip).
+   - Settings are kept in flash (NVS) and come from:
+       * the SERVER  : device ID, key, counting / filter / timing settings
+       * the SERIAL  : network (IP / gateway / mask / DNS / server address)
+   - OTA: the same .bin is pushed to all boards from the app.
+
+   HOW A NEW BOARD JOINS (zero code change)
+   1. Set network once by USB Serial (only if the LAN has no DHCP):
+        set ip 10.5.16.31
+        set gw 10.5.16.254
+        set mask 255.255.255.0
+        set dns 10.5.16.254
+        set dhcp off
+        set server 10.5.20.2:5000
+        reboot
+   2. Board calls  POST /api/device/hello  every 30 s with its HW ID.
+      The app shows it in Device Manager -> "Pending devices".
+   3. In the app: Approve -> give Device ID (MC07) -> link to a machine.
+   4. Next hello returns device_id + device_key + settings.
+      The board saves them and starts sending events. Done.
+   Replace a broken board: approve the new HW ID on the same machine.
+
+   EVENTS (unchanged from v1.2.x, plus a few new fields)
+   - Board ONLY counts pulses. App turns them into courses and pieces.
+   - RUNNING / IDLE (no pulse for idle_timeout_ms) / COUNT (every
+     send_every_pulses) / HEARTBEAT / SCHEDULED / RESET / BOOT
+   - Queue of 64 events when the network or server is down.
+
+   REMOTE CONTROL FROM THE APP
+   - Settings: the server sends cfg_ver; if it differs, the board downloads
+     GET /api/device/config and saves the new settings.
+   - Commands: reset_count, reboot, ota_check, clear_stats, lan_rescan
+     (each runs once; the board reports it back as cmd_ack).
+
+   SAFETY
+   - Task watchdog: board restarts itself if the program hangs > 30 s.
+   - Pulse counting runs in its own 1 ms timer (noise filter from v1.2.1).
+
+   !! Keep the OTA code in every new version and raise FW_VERSION.
+   !! Partition Scheme: "Minimal SPIFFS (1.9MB APP with OTA)"
+
+   WIRING (same as before)
+     W5500: 5V->5V/VIN, GND, MISO->19, MOSI->23, SCLK->18, SCS->5, RST->4
+     Sensor: signal -> GPIO27 (4.7k pull-up to 3.3V or PC817 output)
+
+   LIBRARY: "Ethernet" by Arduino
+   SERIAL 115200 (Serial Monitor: "Newline"):
+     i  status          show  settings      register  ask server now
+     c  simulate pulse  s     heartbeat     r  reset count
+     d  clear filter stats    u  OTA check  n / f  LAN mode next / auto
+     set id <ID> | set key <KEY> | set ip/gw/mask/dns <a.b.c.d>
+     set dhcp on|off | set server <a.b.c.d[:port]> | set mac <AA:..>|auto
+     set wifi <ssid> <pass> | set wifi off | reboot | factory
+  =====================================================================
+*/
+
+#include <SPI.h>
+#include <Ethernet.h>
+#include <Preferences.h>
+#include <Update.h>
+#include <WiFi.h>
+#include <ArduinoOTA.h>
+#include <time.h>
+#include "esp_system.h"
+#include "esp_timer.h"
+#include "esp_mac.h"
+#include "esp_task_wdt.h"
+#include "esp_arduino_version.h"
+
+#define FW_VERSION "2.0.0"
+
+// ===================== NETWORK - CHANGE ONLY THE IP FOR EACH NEW BOARD =====================
+// Used on the FIRST start of a new board, then saved in its flash.
+// A later OTA update does NOT change the IP of a board that is already running.
+// (To change a running board: USB Serial  "set ip ..."  then  "reboot")
+#define DEF_STATIC_IP       "10.5.16.32"      // <<< next board: 10.5.16.33, 10.5.16.34 ... (MC01 = .31)
+#define DEF_GATEWAY         "10.5.16.254"
+#define DEF_SUBNET_MASK     "255.255.255.0"
+#define DEF_DNS_SERVER      "10.5.16.254"
+#define DEF_USE_DHCP        false             // static IP from IT
+
+// ===================== FACTORY DEFAULTS (same for every board) =====================
+#define DEF_SERVER_IP       "10.5.20.2"       // your app server
+#define DEF_SERVER_PORT     5000
+const char* EVENT_PATH  = "/api/event";
+const char* HELLO_PATH  = "/api/device/hello";
+const char* CONFIG_PATH = "/api/device/config";
+const char* OTA_PATH    = "/api/ota/firmware.bin";
+const char* OTA_PASSWORD = "flatknit@ota";    // WiFi OTA from Arduino IDE (only if WiFi is set)
+#define TZ_OFFSET_SEC       19800             // IST
+#define WDT_TIMEOUT_S       30
+
+// Default counting settings (the server can change all of these)
+#define DEF_IDLE_TIMEOUT_MS   10000
+#define DEF_SEND_EVERY        10
+#define DEF_STABLE_LOW_MS     3
+#define DEF_RELEASE_HIGH_MS   30
+#define DEF_MIN_INTERVAL_MS   200
+#define DEF_HEARTBEAT_MIN     5
+#define DEF_OTA_CHECK_SEC     60
+#define DEF_SEND_TIMES        "08:00,16:00,23:59"
+
+// ---------- ONE-TIME MIGRATION (only for boards already running v1.2.x) ----------
+// Set to 1 ONLY when building a special .bin for ONE old board, so that after the
+// OTA it keeps its ID, key and static IP. Normal universal build: keep 0.
+#define MIGRATE_FROM_V1     0
+#if MIGRATE_FROM_V1
+const char* MIG_ID   = "MC01";
+const char* MIG_KEY  = "PASTE_OLD_KEY";
+const char* MIG_IP   = "10.5.16.31";
+const char* MIG_GW   = "10.5.16.254";
+const char* MIG_MASK = "255.255.255.0";
+const char* MIG_DNS  = "10.5.16.254";
+const char* MIG_MAC  = "8E:5E:75:DB:BC:77";
+#endif
+// ===================================================================================
+
+// ---------- Pins ----------
+#define SENSOR_PIN 27
+#define PIN_SCK    18
+#define PIN_MISO   19
+#define PIN_MOSI   23
+#define PIN_CS     5
+#define PIN_RST    4
+#define STATUS_LED 2
+
+// ---------- W5500 registers ----------
+#define REG_PHYCFGR  0x002E
+#define REG_VERSIONR 0x0039
+
+// ---------- LAN modes (auto-selected) ----------
+struct PhyMode { uint8_t bits; const char* name; };
+PhyMode MODES[] = {
+  { 0x78, "Auto-negotiation" },
+  { 0x58, "100M Full" },
+  { 0x50, "100M Half" },
+  { 0x40, "10M Half"  },
+  { 0x48, "10M Full"  },
+};
+const int NUM_MODES = sizeof(MODES) / sizeof(MODES[0]);
+
+#define LINK_WAIT_MS      15000
+#define STABLE_MS         60000
+#define DROP_LIMIT        3
+#define HEALTH_FAIL_LIMIT 3
+#define LOST_RESCAN_MS    30000
+
+// ---------- Settings (kept in flash, namespace "cfg") ----------
+struct Config {
+  String    deviceId, deviceKey;
+  bool      dhcp;
+  IPAddress ip, gw, mask, dns;
+  IPAddress serverIp;
+  uint16_t  serverPort;
+  String    macStr;                 // "" = automatic (chip MAC)
+  uint32_t  idleTimeoutMs, sendEvery, stableLowMs, releaseHighMs, minIntervalMs;
+  uint32_t  heartbeatMin, otaCheckSec;
+  String    sendTimes;
+  String    wifiSsid, wifiPass;
+  uint32_t  cfgVer;
+} cfg;
+
+Preferences prefs;      // "machine": pulses, seq, phymode, cmd
+Preferences cfgPrefs;   // "cfg": settings
+
+String hwId;            // factory MAC of the ESP32, e.g. "24:6F:28:AA:BB:CC"
+byte   mac[6];          // MAC used on the LAN
+
+// ---------- Events ----------
+enum EvType { EV_BOOT, EV_RUNNING, EV_IDLE, EV_COUNT, EV_HEARTBEAT, EV_SCHEDULED, EV_RESET };
+const char* EV_NAMES[] = { "BOOT", "RUNNING", "IDLE", "COUNT", "HEARTBEAT", "SCHEDULED", "RESET" };
+
+struct Event {
+  uint8_t  type;
+  uint8_t  running;
+  uint32_t pulses;
+  uint32_t ms;
+  uint32_t seq;
+  uint32_t dur;
+};
+
+// Function declarations placed AFTER the types they use.
+// (The Arduino IDE otherwise puts its own declarations above 'Event'
+//  -> error "'Event' does not name a type".)
+bool sendEvent(const Event& e);
+void pushEvent(EvType type, uint32_t dur);
+
+bool registered() { return cfg.deviceKey.length() > 0; }
+
+#define QSIZE 64
+Event    q[QSIZE];
+int      qHead = 0, qCount = 0;
+uint32_t qDropped = 0;
+
+// ---------- Sensor / filter ----------
+SPISettings w5500SPI(8000000, MSBFIRST, SPI_MODE0);
+volatile uint32_t pulseCount = 0;
+volatile uint32_t lastPulseMs = 0;
+volatile uint32_t gStableLow = DEF_STABLE_LOW_MS, gReleaseHigh = DEF_RELEASE_HIGH_MS, gMinInterval = DEF_MIN_INTERVAL_MS;
+portMUX_TYPE      pulseMux = portMUX_INITIALIZER_UNLOCKED;
+esp_timer_handle_t sensorTimer = nullptr;
+volatile bool     hadPulse = false;
+volatile uint32_t lastActivityMs = 0;
+volatile uint32_t glitchShort = 0, glitchFast = 0;
+volatile uint32_t lastIntervalMs = 0, minIntervalMs = 0;
+volatile uint32_t lastWidthMs = 0, minWidthMs = 0;
+uint16_t fLowRun = 0, fHighRun = 0, fWidthRun = 0;
+bool     fArmed = true, fCounted = false;
+
+// ---------- State ----------
+uint32_t seqNo = 0;
+uint32_t lastSeenPulses = 0, lastBlock = 0, lastSavedPulses = 0;
+bool     running = false;
+uint32_t runSince = 0, idleSince = 0;
+uint32_t lastSaveMs = 0, lastHeartbeat = 0, ledOffAt = 0;
+long     lastSchedMin = -1;
+
+bool     timeValid = false;
+uint32_t epochAtSync = 0, millisAtSync = 0;
+
+uint32_t lastSendTry = 0, sendDelay = 0;
+bool     lastServerOK = false;
+uint32_t sentOK = 0, sentFail = 0, authFails = 0;
+
+uint32_t lastHello = 0;
+String   regStatus = "not asked yet";
+bool     configWanted = false;
+uint32_t lastConfigTry = 0;
+uint32_t lastCmdId = 0;
+
+int      modeIdx = 0, scanStartIdx = 0;
+bool     confirmed = false, healthRequired = true;
+bool     linkOn = false, ipReady = false, usingDHCP = false, ignoreDrop = false;
+uint32_t modeStart = 0, linkChangeMs = 0, lastPoll = 0, lastHealthTest = 0;
+uint32_t dropTotal = 0, dropsInMode = 0, healthFails = 0;
+
+uint32_t lastOtaCheck = 0;
+String   otaLast = "not checked yet";
+bool     wifiOtaReady = false, wifiStarted = false;
+uint32_t lastWifiTry = 0;
+
+bool     chipPresent = false;
+uint32_t lastChipCheck = 0;
+String   serialLine;
+
+// =======================================================================
+//                               HELPERS
+// =======================================================================
+void feedWdt() { esp_task_wdt_reset(); }
+
+String macToStr(const byte* m) {
+  char b[18];
+  snprintf(b, sizeof(b), "%02X:%02X:%02X:%02X:%02X:%02X", m[0], m[1], m[2], m[3], m[4], m[5]);
+  return String(b);
+}
+
+bool strToMac(const String& s, byte* out) {
+  int v[6];
+  if (sscanf(s.c_str(), "%x:%x:%x:%x:%x:%x", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6) return false;
+  for (int i = 0; i < 6; i++) { if (v[i] < 0 || v[i] > 255) return false; out[i] = (byte)v[i]; }
+  return true;
+}
+
+IPAddress strToIp(const String& s, IPAddress def) {
+  IPAddress a;
+  return a.fromString(s) ? a : def;
+}
+
+uint32_t clampU(uint32_t v, uint32_t lo, uint32_t hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+String deviceName() {                                // also used as WiFi hostname (no ':' allowed)
+  if (cfg.deviceId.length()) return cfg.deviceId;
+  String h = hwId.substring(9);
+  h.replace(":", "");
+  return "MM-" + h;
+}
+
+// Tiny reader for FLAT json objects: {"a":"x","b":12,"c":true}
+// Returns false if the key is missing or null.
+bool jsonGet(const String& js, const char* key, String& out) {
+  String pat = String("\"") + key + "\"";
+  int len = js.length();
+  int k = js.indexOf(pat);
+  while (k >= 0) {
+    int p = k + pat.length();
+    while (p < len && js[p] == ' ') p++;
+    if (p < len && js[p] == ':') {
+      p++;
+      while (p < len && js[p] == ' ') p++;
+      if (p < len && js[p] == '"') {
+        String s;
+        p++;
+        while (p < len && js[p] != '"') {
+          if (js[p] == '\\' && p + 1 < len) p++;
+          s += js[p];
+          p++;
+        }
+        out = s;
+        return true;
+      }
+      int e = p;
+      while (e < len && js[e] != ',' && js[e] != '}' && js[e] != ' ' && js[e] != '\r' && js[e] != '\n') e++;
+      out = js.substring(p, e);
+      out.trim();
+      return out.length() > 0 && out != "null";
+    }
+    k = js.indexOf(pat, k + 1);
+  }
+  return false;
+}
+
+bool jsonNum(const String& js, const char* key, uint32_t& out) {
+  String s;
+  if (!jsonGet(js, key, s)) return false;
+  for (size_t i = 0; i < s.length(); i++) if (!isDigit(s[i])) return false;
+  out = strtoul(s.c_str(), nullptr, 10);
+  return true;
+}
+
+// =======================================================================
+//                               SETTINGS
+// =======================================================================
+void loadConfig() {
+  cfgPrefs.begin("cfg", false);
+
+#if MIGRATE_FROM_V1
+  if (!cfgPrefs.isKey("key")) {                      // first boot after OTA from v1.2.x
+    cfgPrefs.putString("id", MIG_ID);
+    cfgPrefs.putString("key", MIG_KEY);
+    cfgPrefs.putBool("dhcp", false);
+    cfgPrefs.putString("ip", MIG_IP);
+    cfgPrefs.putString("gw", MIG_GW);
+    cfgPrefs.putString("mask", MIG_MASK);
+    cfgPrefs.putString("dns", MIG_DNS);
+    cfgPrefs.putString("mac", MIG_MAC);
+    Serial.println("[CFG] Migrated v1 settings into flash");
+  }
+#endif
+
+  if (!cfgPrefs.isKey("ip")) {                       // very first start: save the network from the code
+    cfgPrefs.putBool("dhcp", DEF_USE_DHCP);
+    cfgPrefs.putString("ip", DEF_STATIC_IP);
+    cfgPrefs.putString("gw", DEF_GATEWAY);
+    cfgPrefs.putString("mask", DEF_SUBNET_MASK);
+    cfgPrefs.putString("dns", DEF_DNS_SERVER);
+    Serial.println("[CFG] First start: network " DEF_STATIC_IP " saved in flash");
+  }
+
+  cfg.deviceId      = cfgPrefs.getString("id", "");
+  cfg.deviceKey     = cfgPrefs.getString("key", "");
+  cfg.dhcp          = cfgPrefs.getBool("dhcp", DEF_USE_DHCP);
+  cfg.ip            = strToIp(cfgPrefs.getString("ip", ""),   IPAddress(0, 0, 0, 0));
+  cfg.gw            = strToIp(cfgPrefs.getString("gw", ""),   IPAddress(0, 0, 0, 0));
+  cfg.mask          = strToIp(cfgPrefs.getString("mask", ""), IPAddress(255, 255, 255, 0));
+  cfg.dns           = strToIp(cfgPrefs.getString("dns", ""),  cfg.gw);
+  cfg.serverIp      = strToIp(cfgPrefs.getString("srv", DEF_SERVER_IP), strToIp(DEF_SERVER_IP, IPAddress(0, 0, 0, 0)));
+  cfg.serverPort    = cfgPrefs.getUShort("port", DEF_SERVER_PORT);
+  cfg.macStr        = cfgPrefs.getString("mac", "");
+  cfg.idleTimeoutMs = cfgPrefs.getUInt("idle", DEF_IDLE_TIMEOUT_MS);
+  cfg.sendEvery     = cfgPrefs.getUInt("every", DEF_SEND_EVERY);
+  cfg.stableLowMs   = cfgPrefs.getUInt("flow", DEF_STABLE_LOW_MS);
+  cfg.releaseHighMs = cfgPrefs.getUInt("fhigh", DEF_RELEASE_HIGH_MS);
+  cfg.minIntervalMs = cfgPrefs.getUInt("fmin", DEF_MIN_INTERVAL_MS);
+  cfg.heartbeatMin  = cfgPrefs.getUInt("hb", DEF_HEARTBEAT_MIN);
+  cfg.otaCheckSec   = cfgPrefs.getUInt("ota", DEF_OTA_CHECK_SEC);
+  cfg.sendTimes     = cfgPrefs.getString("times", DEF_SEND_TIMES);
+  cfg.wifiSsid      = cfgPrefs.getString("wssid", "");
+  cfg.wifiPass      = cfgPrefs.getString("wpass", "");
+  cfg.cfgVer        = cfgPrefs.getUInt("cver", 0);
+
+  // keep values in a safe range even if flash holds something odd
+  cfg.idleTimeoutMs = clampU(cfg.idleTimeoutMs, 2000, 600000);
+  cfg.sendEvery     = clampU(cfg.sendEvery, 1, 1000);
+  cfg.stableLowMs   = clampU(cfg.stableLowMs, 1, 50);
+  cfg.releaseHighMs = clampU(cfg.releaseHighMs, 5, 1000);
+  cfg.minIntervalMs = clampU(cfg.minIntervalMs, 20, 10000);
+  cfg.heartbeatMin  = clampU(cfg.heartbeatMin, 0, 60);
+  if (cfg.otaCheckSec != 0) cfg.otaCheckSec = clampU(cfg.otaCheckSec, 30, 86400);
+  if (cfg.serverPort == 0) cfg.serverPort = DEF_SERVER_PORT;
+
+  gStableLow   = cfg.stableLowMs;
+  gReleaseHigh = cfg.releaseHighMs;
+  gMinInterval = cfg.minIntervalMs;
+}
+
+// Apply settings sent by the server (hello / config / event reply). Network is NOT changed here.
+void applyServerConfig(const String& js) {
+  String s;
+  uint32_t n;
+  bool changed = false;
+
+  if (jsonGet(js, "device_id", s) && s.length() && s != cfg.deviceId) { cfg.deviceId = s; cfgPrefs.putString("id", s); changed = true; }
+  if (jsonGet(js, "device_key", s) && s.length() >= 8 && s != cfg.deviceKey) {
+    cfg.deviceKey = s; cfgPrefs.putString("key", s); authFails = 0; changed = true;
+    Serial.println("[REG] Device key received and saved");
+  }
+  if (jsonNum(js, "idle_timeout_ms", n))   { cfg.idleTimeoutMs = clampU(n, 2000, 600000); cfgPrefs.putUInt("idle", cfg.idleTimeoutMs); changed = true; }
+  if (jsonNum(js, "send_every_pulses", n)) { cfg.sendEvery     = clampU(n, 1, 1000);       cfgPrefs.putUInt("every", cfg.sendEvery); lastBlock = pulseCount / cfg.sendEvery; changed = true; }
+  if (jsonNum(js, "stable_low_ms", n))     { cfg.stableLowMs   = clampU(n, 1, 50);         cfgPrefs.putUInt("flow", cfg.stableLowMs); changed = true; }
+  if (jsonNum(js, "release_high_ms", n))   { cfg.releaseHighMs = clampU(n, 5, 1000);       cfgPrefs.putUInt("fhigh", cfg.releaseHighMs); changed = true; }
+  if (jsonNum(js, "min_interval_ms", n))   { cfg.minIntervalMs = clampU(n, 20, 10000);     cfgPrefs.putUInt("fmin", cfg.minIntervalMs); changed = true; }
+  if (jsonNum(js, "heartbeat_min", n))     { cfg.heartbeatMin  = clampU(n, 0, 60);         cfgPrefs.putUInt("hb", cfg.heartbeatMin); changed = true; }
+  if (jsonNum(js, "ota_check_sec", n))     { cfg.otaCheckSec   = (n == 0) ? 0 : clampU(n, 30, 86400); cfgPrefs.putUInt("ota", cfg.otaCheckSec); changed = true; }
+  if (jsonGet(js, "send_times", s))        { cfg.sendTimes = s; cfgPrefs.putString("times", s); changed = true; }
+  if (jsonNum(js, "cfg_ver", n) && n != cfg.cfgVer) { cfg.cfgVer = n; cfgPrefs.putUInt("cver", n); changed = true; }
+
+  portENTER_CRITICAL(&pulseMux);
+  gStableLow   = cfg.stableLowMs;
+  gReleaseHigh = cfg.releaseHighMs;
+  gMinInterval = cfg.minIntervalMs;
+  portEXIT_CRITICAL(&pulseMux);
+
+  if (changed) Serial.printf("[CFG] Settings from server applied (cfg_ver %u)\n", cfg.cfgVer);
+}
+
+void setupMac() {
+  if (cfg.macStr.length() && strToMac(cfg.macStr, mac)) return;
+  esp_read_mac(mac, ESP_MAC_ETH);                    // unique per chip
+}
+
+// =======================================================================
+//                               SENSOR
+// =======================================================================
+void sensorTick(void*) {
+  bool low = (digitalRead(SENSOR_PIN) == LOW);
+  uint32_t now = millis();
+  portENTER_CRITICAL(&pulseMux);
+  if (fArmed) {
+    if (low) {
+      if (++fLowRun >= gStableLow) {
+        if (!hadPulse || now - lastActivityMs >= gMinInterval) {
+          if (hadPulse) {
+            uint32_t iv = now - lastPulseMs;
+            lastIntervalMs = iv;
+            if (minIntervalMs == 0 || iv < minIntervalMs) minIntervalMs = iv;
+          }
+          pulseCount++;
+          lastPulseMs = now;
+          hadPulse = true;
+          fCounted = true;
+        } else {
+          glitchFast++;
+          fCounted = false;
+        }
+        lastActivityMs = now;
+        fArmed = false;
+        fWidthRun = fLowRun;
+        fHighRun = 0;
+      }
+    } else {
+      if (fLowRun > 0) glitchShort++;
+      fLowRun = 0;
+    }
+  } else {
+    if (low) {
+      fHighRun = 0;
+      if (fWidthRun < 60000) fWidthRun++;
+    } else if (++fHighRun >= gReleaseHigh) {
+      if (fCounted) {
+        lastWidthMs = fWidthRun;
+        if (minWidthMs == 0 || fWidthRun < minWidthMs) minWidthMs = fWidthRun;
+      }
+      fArmed = true;
+      fLowRun = 0;
+    }
+  }
+  portEXIT_CRITICAL(&pulseMux);
+}
+
+void startSensor() {
+  pinMode(SENSOR_PIN, INPUT_PULLUP);
+  esp_timer_create_args_t ta = {};
+  ta.callback = &sensorTick;
+  ta.name     = "sensor";
+  if (esp_timer_create(&ta, &sensorTimer) == ESP_OK &&
+      esp_timer_start_periodic(sensorTimer, 1000) == ESP_OK) {
+    Serial.printf("[SENSOR] Filter ON: low %u ms, release %u ms, min interval %u ms\n",
+                  (uint32_t)gStableLow, (uint32_t)gReleaseHigh, (uint32_t)gMinInterval);
+  } else {
+    Serial.println("[SENSOR] ERROR: timer start failed - pulses NOT counted");
+  }
+}
+
+void clearFilterStats() {
+  portENTER_CRITICAL(&pulseMux);
+  glitchShort = glitchFast = 0;
+  lastIntervalMs = minIntervalMs = 0;
+  lastWidthMs = minWidthMs = 0;
+  portEXIT_CRITICAL(&pulseMux);
+}
+
+// =======================================================================
+//                               W5500 RAW
+// =======================================================================
+uint8_t regRead(uint16_t a) {
+  SPI.beginTransaction(w5500SPI);
+  digitalWrite(PIN_CS, LOW);
+  SPI.transfer(a >> 8); SPI.transfer(a & 0xFF); SPI.transfer(0x00);
+  uint8_t v = SPI.transfer(0x00);
+  digitalWrite(PIN_CS, HIGH);
+  SPI.endTransaction();
+  return v;
+}
+void regWrite(uint16_t a, uint8_t v) {
+  SPI.beginTransaction(w5500SPI);
+  digitalWrite(PIN_CS, LOW);
+  SPI.transfer(a >> 8); SPI.transfer(a & 0xFF); SPI.transfer(0x04); SPI.transfer(v);
+  digitalWrite(PIN_CS, HIGH);
+  SPI.endTransaction();
+}
+bool chipOK()  { return regRead(REG_VERSIONR) == 0x04; }
+bool phyLink() { return regRead(REG_PHYCFGR) & 0x01; }
+
+// =======================================================================
+//                               TIME
+// =======================================================================
+uint32_t nowEpoch() { return epochAtSync + (millis() - millisAtSync) / 1000; }
+
+String fmtTime(uint32_t epochUTC) {
+  time_t t = (time_t)epochUTC + TZ_OFFSET_SEC;
+  struct tm tmv;
+  gmtime_r(&t, &tmv);
+  char b[24];
+  strftime(b, sizeof(b), "%Y-%m-%d %H:%M:%S", &tmv);
+  return String(b);
+}
+
+void syncTimeFrom(const String& js) {
+  uint32_t ep;
+  if (jsonNum(js, "server_epoch", ep) && ep > 1600000000UL) {
+    bool first = !timeValid;
+    epochAtSync = ep; millisAtSync = millis(); timeValid = true;
+    if (first) Serial.println("[TIME] Synced from server: " + fmtTime(ep));
+  }
+}
+
+// =======================================================================
+//                               HTTP
+// =======================================================================
+void noteServerResult(bool ok) {
+  lastServerOK = ok;
+  if (ok) healthFails = 0; else healthFails++;
+}
+
+static String readLine(EthernetClient& c, uint32_t timeoutMs) {
+  String s;
+  uint32_t t = millis();
+  while (millis() - t < timeoutMs) {
+    while (c.available()) {
+      char ch = (char)c.read();
+      if (ch == '\n') return s;
+      if (ch != '\r' && s.length() < 200) s += ch;
+      t = millis();
+    }
+    if (!c.connected()) break;
+    delay(1);
+  }
+  return s;
+}
+
+// Simple HTTP/1.1 request. Returns status code (0 = no connection / no reply).
+int httpRequest(const char* method, const String& path, const String& body, String& respBody) {
+  respBody = "";
+  EthernetClient c;
+  c.setConnectionTimeout(2000);
+  if (!c.connect(cfg.serverIp, cfg.serverPort)) { noteServerResult(false); return 0; }
+
+  c.print(String(method) + " " + path + " HTTP/1.1\r\n");
+  c.print("Host: " + cfg.serverIp.toString() + "\r\n");
+  if (body.length()) {
+    c.print("Content-Type: application/json\r\n");
+    c.print("Content-Length: " + String(body.length()) + "\r\n");
+  }
+  c.print("Connection: close\r\n\r\n");
+  if (body.length()) c.print(body);
+
+  String status = readLine(c, 4000);
+  int sp = status.indexOf(' ');
+  int code = (sp > 0) ? status.substring(sp + 1, sp + 4).toInt() : 0;
+
+  int len = -1;
+  while (true) {
+    String h = readLine(c, 3000);
+    if (h.length() == 0) break;
+    String lo = h; lo.toLowerCase();
+    if (lo.startsWith("content-length:")) len = h.substring(15).toInt();
+  }
+  uint32_t t = millis();
+  while (millis() - t < 3000 && respBody.length() < 2048 && (len < 0 || (int)respBody.length() < len)) {
+    while (c.available() && respBody.length() < 2048) { respBody += (char)c.read(); t = millis(); }
+    if (!c.connected() && !c.available()) break;
+    delay(1);
+  }
+  c.stop();
+  noteServerResult(code > 0);           // any HTTP reply = server reachable
+  return code;
+}
+
+// ---------- Commands sent by the server (each runs once) ----------
+void pushEvent(EvType type, uint32_t dur);
+void checkOTA(bool manual);
+void nextMode(const char* reason);
+void saveCount(bool force);
+
+void doResetCount() {
+  portENTER_CRITICAL(&pulseMux);
+  pulseCount = 0;
+  portEXIT_CRITICAL(&pulseMux);
+  lastSeenPulses = 0; lastBlock = 0;
+  saveCount(true);
+  pushEvent(EV_RESET, 0);
+}
+
+void handleServerCommand(const String& js) {
+  uint32_t id;
+  String name;
+  if (!jsonNum(js, "cmd_id", id) || !jsonGet(js, "cmd", name)) return;
+  if (id <= lastCmdId) return;                       // already done
+  lastCmdId = id;
+  prefs.putUInt("cmd", id);                          // save BEFORE running (reboot-safe)
+  Serial.printf("[CMD] Server command #%u: %s\n", id, name.c_str());
+  if      (name == "reset_count") doResetCount();
+  else if (name == "clear_stats") clearFilterStats();
+  else if (name == "ota_check")   lastOtaCheck = 0, otaLast = "check requested";
+  else if (name == "lan_rescan")  { scanStartIdx = modeIdx; nextMode("server command"); }
+  else if (name == "reboot")      { saveCount(true); delay(200); ESP.restart(); }
+  else Serial.println("[CMD] Unknown command - ignored");
+}
+
+// Common handling of every server reply
+void handleReply(const String& js) {
+  syncTimeFrom(js);
+  uint32_t v;
+  if (jsonNum(js, "cfg_ver", v) && v != cfg.cfgVer) configWanted = true;
+  handleServerCommand(js);
+}
+
+// ---------- Registration ----------
+void sayHello() {
+  String j = "{";
+  j += "\"hw_id\":\"" + hwId + "\",";
+  j += "\"mac\":\"" + macToStr(mac) + "\",";
+  j += "\"device_id\":\"" + cfg.deviceId + "\",";
+  j += "\"has_key\":" + String(registered() ? "true" : "false") + ",";
+  j += "\"fw\":\"" FW_VERSION "\",";
+  j += "\"ip\":\"" + Ethernet.localIP().toString() + "\",";
+  j += "\"pulses\":" + String((uint32_t)pulseCount);
+  j += "}";
+
+  String resp;
+  int code = httpRequest("POST", HELLO_PATH, j, resp);
+  if (code == 0) { regStatus = "server not reachable"; return; }
+  syncTimeFrom(resp);
+
+  String st;
+  jsonGet(resp, "status", st);
+  if (code == 200 && st == "approved") {
+    applyServerConfig(resp);
+    handleServerCommand(resp);
+    regStatus = "approved as " + cfg.deviceId;
+    Serial.println("[REG] " + regStatus);
+    sendDelay = 0;
+  } else if (code == 202 || st == "pending") {
+    regStatus = "pending - approve HW ID " + hwId + " in Device Manager";
+    Serial.println("[REG] " + regStatus);
+  } else if (code == 403 || st == "disabled") {
+    regStatus = "disabled in Device Manager";
+    Serial.println("[REG] Device is disabled in the app");
+  } else {
+    regStatus = "hello failed (HTTP " + String(code) + ")";
+    Serial.println("[REG] " + regStatus);
+  }
+}
+
+void handleRegistration(uint32_t now) {
+  if (!linkOn || !ipReady) return;
+  // Unregistered: ask every 30 s.  Key rejected 3x: ask every 60 s (recovery, key kept until a new one arrives)
+  uint32_t every = !registered() ? 30000UL : (authFails >= 3 ? 60000UL : 0);
+  if (every == 0) return;
+  if (lastHello != 0 && now - lastHello < every) return;
+  lastHello = now;
+  sayHello();
+}
+
+void fetchConfig(uint32_t now) {
+  if (!configWanted || !registered() || !linkOn || !ipReady) return;
+  if (lastConfigTry != 0 && now - lastConfigTry < 30000) return;
+  lastConfigTry = now;
+  String resp;
+  int code = httpRequest("GET", String(CONFIG_PATH) + "?key=" + cfg.deviceKey + "&hw_id=" + hwId, "", resp);
+  if (code == 200) {
+    applyServerConfig(resp);
+    handleServerCommand(resp);
+    configWanted = false;
+  } else {
+    Serial.printf("[CFG] Config download failed (HTTP %d)\n", code);
+  }
+}
+
+// =======================================================================
+//                               EVENTS
+// =======================================================================
+void pushEvent(EvType type, uint32_t dur) {
+  Event e;
+  e.type    = type;
+  e.running = running ? 1 : 0;
+  e.pulses  = pulseCount;
+  e.ms      = millis();
+  e.seq     = ++seqNo;
+  e.dur     = dur;
+  prefs.putUInt("seq", seqNo);
+
+  if (qCount == QSIZE) {
+    qHead = (qHead + 1) % QSIZE;
+    qCount--;
+    qDropped++;
+  }
+  q[(qHead + qCount) % QSIZE] = e;
+  qCount++;
+
+  Serial.printf("[EVENT] #%u %s  pulses=%u  dur=%us  (queue %d)\n",
+                e.seq, EV_NAMES[type], e.pulses, dur, qCount);
+}
+
+void saveCount(bool force) {
+  uint32_t c = pulseCount;
+  if (c == lastSavedPulses) return;
+  if (!force && millis() - lastSaveMs < 10000) return;
+  prefs.putUInt("pulses", c);
+  lastSavedPulses = c;
+  lastSaveMs = millis();
+}
+
+bool sendEvent(const Event& e) {
+  uint32_t age = (millis() - e.ms) / 1000;
+  String j = "{";
+  j += "\"device_id\":\"" + cfg.deviceId + "\",";
+  j += "\"hw_id\":\"" + hwId + "\",";
+  j += "\"seq\":" + String(e.seq) + ",";
+  j += "\"event\":\"" + String(EV_NAMES[e.type]) + "\",";
+  j += "\"state\":\"" + String(e.running ? "RUNNING" : "IDLE") + "\",";
+  j += "\"pulses\":" + String(e.pulses) + ",";
+  j += "\"duration_s\":" + String(e.dur) + ",";
+  j += "\"age_s\":" + String(age) + ",";
+  j += "\"device_time\":\"" + (timeValid ? fmtTime(nowEpoch() - age) : String("NA")) + "\",";
+  j += "\"uptime_s\":" + String(millis() / 1000) + ",";
+  j += "\"queued\":" + String(qCount - 1) + ",";
+  j += "\"fw\":\"" FW_VERSION "\",";
+  j += "\"cfg_ver\":" + String(cfg.cfgVer) + ",";
+  j += "\"cmd_ack\":" + String(lastCmdId) + ",";
+  j += "\"flt_short\":" + String((uint32_t)glitchShort) + ",";
+  j += "\"flt_fast\":" + String((uint32_t)glitchFast) + ",";
+  j += "\"min_interval_ms\":" + String((uint32_t)minIntervalMs) + ",";
+  j += "\"min_width_ms\":" + String((uint32_t)minWidthMs) + ",";
+  j += "\"ip\":\"" + Ethernet.localIP().toString() + "\"";
+  j += "}";
+
+  String resp;
+  int code = httpRequest("POST", String(EVENT_PATH) + "?key=" + cfg.deviceKey, j, resp);
+  bool ok = code >= 200 && code < 300;
+
+  if (ok) {
+    authFails = 0;
+    handleReply(resp);
+    sentOK++;
+    Serial.printf("[SEND] OK  #%u %s\n", e.seq, EV_NAMES[e.type]);
+  } else {
+    sentFail++;
+    if (code == 401) authFails++;
+    Serial.printf("[SEND] FAILED #%u (HTTP %d)%s\n", e.seq, code,
+                  code == 401 ? "  -> key not accepted, asking server again" :
+                  code == 409 ? "  -> device not linked to a machine in Device Manager" : "");
+  }
+  return ok;
+}
+
+void processQueue() {
+  if (qCount == 0 || !linkOn || !ipReady || !registered()) return;
+  if (millis() - lastSendTry < sendDelay) return;
+  lastSendTry = millis();
+  if (sendEvent(q[qHead])) {
+    qHead = (qHead + 1) % QSIZE;
+    qCount--;
+    sendDelay = 100;
+  } else {
+    sendDelay = 10000;
+  }
+}
+
+// =======================================================================
+//                               OTA OVER LAN (pull from server)
+// =======================================================================
+void checkOTA(bool manual) {
+  if (!linkOn || !ipReady) { if (manual) Serial.println("[OTA] LAN not ready"); return; }
+  if (!registered())       { if (manual) Serial.println("[OTA] Not registered yet"); return; }
+  if (qCount > 0 && !manual) return;
+
+  EthernetClient c;
+  c.setConnectionTimeout(3000);
+  if (!c.connect(cfg.serverIp, cfg.serverPort)) { otaLast = "server not reachable"; noteServerResult(false); return; }
+
+  c.print(String("GET ") + OTA_PATH + "?key=" + cfg.deviceKey + "&device_id=" + cfg.deviceId +
+          "&hw_id=" + hwId + "&version=" FW_VERSION " HTTP/1.1\r\n");
+  c.print("Host: " + cfg.serverIp.toString() + "\r\n");
+  c.print("Connection: close\r\n\r\n");
+
+  String status = readLine(c, 5000);
+  int sp = status.indexOf(' ');
+  int code = (sp > 0) ? status.substring(sp + 1, sp + 4).toInt() : 0;
+  noteServerResult(code > 0);
+
+  int len = -1;
+  String md5, ver;
+  while (true) {
+    String h = readLine(c, 5000);
+    if (h.length() == 0) break;
+    String lo = h; lo.toLowerCase();
+    if (lo.startsWith("content-length:")) len = h.substring(15).toInt();
+    else if (lo.startsWith("x-md5:"))     { md5 = h.substring(6); md5.trim(); }
+    else if (lo.startsWith("x-version:")) { ver = h.substring(10); ver.trim(); }
+  }
+
+  if (code == 304) { c.stop(); otaLast = "up to date (" FW_VERSION ")"; if (manual) Serial.println("[OTA] Up to date"); return; }
+  if (code != 200 || len <= 0) { c.stop(); otaLast = "HTTP " + String(code); Serial.printf("[OTA] Check failed (HTTP %d)\n", code); return; }
+
+  Serial.printf("[OTA] New firmware %s (%d bytes) -> updating...\n", ver.c_str(), len);
+  saveCount(true);
+  if (!Update.begin(len)) { Serial.println("[OTA] Not enough space - check Partition Scheme"); c.stop(); otaLast = "no space"; return; }
+  if (md5.length() == 32) Update.setMD5(md5.c_str());
+
+  uint8_t buf[1024];
+  int done = 0, lastPct = -1;
+  uint32_t t = millis();
+  while (done < len && millis() - t < 15000) {
+    feedWdt();
+    int n = c.available();
+    if (n > 0) {
+      n = c.read(buf, min(n, (int)sizeof(buf)));
+      if (n > 0) {
+        if (Update.write(buf, n) != (size_t)n) break;
+        done += n;
+        t = millis();
+        int pct = (int)((done * 100LL) / len);
+        if (pct / 10 != lastPct / 10) { Serial.printf("[OTA] %d%%\n", pct); lastPct = pct; }
+      }
+    } else if (!c.connected()) {
+      break;
+    } else {
+      delay(1);
+    }
+  }
+  c.stop();
+
+  if (done == len && Update.end(true)) {
+    Serial.printf("[OTA] Done -> version %s. Restarting...\n", ver.c_str());
+    saveCount(true);
+    delay(300);
+    ESP.restart();
+  } else {
+    Update.abort();
+    otaLast = "failed at " + String(done) + "/" + String(len);
+    Serial.printf("[OTA] FAILED (%d/%d bytes, %s) - old firmware kept\n", done, len, Update.errorString());
+  }
+}
+
+void handleOTA(uint32_t now) {
+  if (cfg.otaCheckSec == 0 && lastOtaCheck != 0) return;
+  if (lastOtaCheck != 0 && now - lastOtaCheck < cfg.otaCheckSec * 1000UL) return;
+  if (!registered() || !linkOn || !ipReady) return;
+  lastOtaCheck = now;
+  checkOTA(false);
+}
+
+// =======================================================================
+//                               WIFI (optional, laptop OTA)
+// =======================================================================
+void handleWifi(uint32_t now) {
+  if (cfg.wifiSsid.length() == 0) return;
+  if (!wifiStarted) {
+    WiFi.mode(WIFI_STA);
+    WiFi.setHostname(deviceName().c_str());
+    WiFi.setAutoReconnect(true);
+    WiFi.begin(cfg.wifiSsid.c_str(), cfg.wifiPass.c_str());
+    wifiStarted = true;
+    lastWifiTry = now;
+    return;
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!wifiOtaReady) {
+      ArduinoOTA.setHostname(deviceName().c_str());
+      ArduinoOTA.setPassword(OTA_PASSWORD);
+      ArduinoOTA.onStart([]() { saveCount(true); Serial.println("[WIFI-OTA] Upload started"); });
+      ArduinoOTA.onEnd([]()   { saveCount(true); Serial.println("[WIFI-OTA] Done, restarting"); });
+      ArduinoOTA.onError([](ota_error_t e) { Serial.printf("[WIFI-OTA] Error %u\n", e); });
+      ArduinoOTA.begin();
+      wifiOtaReady = true;
+      Serial.print("[WIFI] Connected  IP "); Serial.println(WiFi.localIP());
+    }
+    ArduinoOTA.handle();
+  } else if (now - lastWifiTry > 60000) {
+    lastWifiTry = now;
+    WiFi.disconnect();
+    WiFi.begin(cfg.wifiSsid.c_str(), cfg.wifiPass.c_str());
+  }
+}
+
+// =======================================================================
+//                               LAN AUTO MODE
+// =======================================================================
+void writePhy(uint8_t bits) {
+  regWrite(REG_PHYCFGR, bits);
+  delay(100);
+  regWrite(REG_PHYCFGR, bits | 0x80);
+}
+
+void applyMode(int idx) {
+  modeIdx = idx;
+  Serial.printf("[LAN] Trying %s\n", MODES[modeIdx].name);
+  writePhy(MODES[modeIdx].bits);
+  uint32_t now = millis();
+  modeStart = linkChangeMs = now;
+  linkOn = ipReady = ignoreDrop = confirmed = lastServerOK = false;
+  dropsInMode = healthFails = 0;
+}
+
+void nextMode(const char* reason) {
+  Serial.printf("[LAN] %s failed: %s\n", MODES[modeIdx].name, reason);
+  int n = (modeIdx + 1) % NUM_MODES;
+  if (n == scanStartIdx && healthRequired) {
+    healthRequired = false;
+    Serial.println("[LAN] Server unreachable in ALL modes -> IP/server problem, not speed.");
+    Serial.println("      Check 'show' settings, server program, firewall port.");
+  }
+  applyMode(n);
+}
+
+void ensurePhyMode() {
+  if ((regRead(REG_PHYCFGR) & 0x78) != MODES[modeIdx].bits) {
+    ignoreDrop = true;
+    writePhy(MODES[modeIdx].bits);
+  }
+}
+
+void setupIP() {
+  Ethernet.init(PIN_CS);
+  usingDHCP = false;
+  if (cfg.dhcp) {
+    Serial.println("[NET] DHCP...");
+    feedWdt();
+    usingDHCP = Ethernet.begin(mac, 6000, 3000);
+    feedWdt();
+  }
+  if (!usingDHCP) {
+    if (cfg.ip == IPAddress(0, 0, 0, 0)) {
+      Serial.println("[NET] No DHCP answer and no static IP set.");
+      Serial.println("      Type over USB:  set ip <a.b.c.d> / set gw / set mask / set dns / set dhcp off / reboot");
+      ipReady = false;
+      return;
+    }
+    Ethernet.begin(mac, cfg.ip, cfg.dns, cfg.gw, cfg.mask);
+    Serial.println("[NET] Static IP " + Ethernet.localIP().toString());
+  } else {
+    Serial.println("[NET] DHCP IP " + Ethernet.localIP().toString());
+  }
+  ipReady = true;
+}
+
+// quick TCP test while a LAN mode is not confirmed yet and nothing else talked to the server
+void healthTest() {
+  EthernetClient c;
+  c.setConnectionTimeout(2000);
+  bool ok = c.connect(cfg.serverIp, cfg.serverPort);
+  c.stop();
+  noteServerResult(ok);
+  if (!ok) Serial.printf("[LAN] Server %s:%u not reachable (%u)\n", cfg.serverIp.toString().c_str(), cfg.serverPort, healthFails);
+}
+
+void handleLan(uint32_t now) {
+  // W5500 present?
+  if (!chipPresent) {
+    if (now - lastChipCheck < 5000) return;
+    lastChipCheck = now;
+    chipPresent = chipOK();
+    if (!chipPresent) { Serial.println("[LAN] W5500 not found - check wiring (MISO 19, MOSI 23, SCK 18, CS 5, RST 4, 5V, GND)"); return; }
+    Serial.println("[LAN] W5500 found");
+    applyMode(modeIdx);
+  }
+
+  if (now - lastPoll < 200) return;
+  lastPoll = now;
+
+  bool l = phyLink();
+  if (l != linkOn) {
+    linkChangeMs = now;
+    if (l) {
+      linkOn = true;
+      Serial.printf("[LAN] Link UP (%s)\n", MODES[modeIdx].name);
+      if (!ipReady) setupIP();
+      ensurePhyMode();                               // Ethernet.begin resets the chip -> set our mode again
+      lastHealthTest = now;
+    } else {
+      linkOn = false;
+      if (ignoreDrop) {
+        ignoreDrop = false;                          // our own PHY reset, not a real drop
+      } else {
+        dropTotal++;
+        dropsInMode++;
+        Serial.printf("[LAN] Link DOWN (drop %u in this mode)\n", dropsInMode);
+        if (!confirmed && dropsInMode >= DROP_LIMIT) { nextMode("link keeps dropping"); return; }
+      }
+    }
+  }
+
+  if (!linkOn) {
+    if (!confirmed && now - modeStart > LINK_WAIT_MS && now - linkChangeMs > LINK_WAIT_MS / 3) {
+      nextMode("no link");
+    } else if (confirmed && now - linkChangeMs > LOST_RESCAN_MS) {
+      scanStartIdx = modeIdx;
+      healthRequired = true;
+      nextMode("link lost");
+    }
+    return;
+  }
+
+  if (!ipReady) {                                    // link up but no IP yet (DHCP failed): retry every 30 s
+    if (now - linkChangeMs > 30000) { linkChangeMs = now; setupIP(); ensurePhyMode(); }
+    return;
+  }
+  if (usingDHCP) Ethernet.maintain();
+
+  if (!confirmed) {
+    if (healthRequired && healthFails >= HEALTH_FAIL_LIMIT) { nextMode("server not reachable"); return; }
+    if (healthRequired && !lastServerOK && now - lastHealthTest > 10000) { lastHealthTest = now; healthTest(); }
+    if (now - modeStart > STABLE_MS && (!healthRequired || lastServerOK)) {
+      confirmed = true;
+      dropsInMode = 0;
+      prefs.putUChar("phymode", (uint8_t)modeIdx);
+      Serial.printf("[LAN] Mode confirmed: %s\n", MODES[modeIdx].name);
+    }
+  }
+}
+
+// =======================================================================
+//                               COUNTING
+// =======================================================================
+void handleCounting(uint32_t now) {
+  uint32_t c, lp;
+  bool hp;
+  portENTER_CRITICAL(&pulseMux);
+  c = pulseCount; lp = lastPulseMs; hp = hadPulse;
+  portEXIT_CRITICAL(&pulseMux);
+
+  if (c != lastSeenPulses) {
+    lastSeenPulses = c;
+    digitalWrite(STATUS_LED, HIGH);
+    ledOffAt = now + 40;
+    if (!running) {
+      uint32_t idleDur = idleSince ? (now - idleSince) / 1000 : 0;
+      running = true;
+      runSince = now;
+      pushEvent(EV_RUNNING, idleDur);                // duration = idle time before
+    }
+    uint32_t blk = c / cfg.sendEvery;
+    if (blk != lastBlock) { lastBlock = blk; pushEvent(EV_COUNT, 0); }
+  }
+
+  if (running && hp && now - lp >= cfg.idleTimeoutMs) {
+    running = false;
+    idleSince = now;
+    pushEvent(EV_IDLE, (now - runSince) / 1000);     // duration = run time before
+  }
+  saveCount(false);
+}
+
+// "08:00,16:00" -> true if minute-of-day m is in the list
+bool isSendTime(int m) {
+  int start = 0;
+  String s = cfg.sendTimes + ",";
+  for (int i = 0; i < (int)s.length(); i++) {
+    if (s[i] != ',') continue;
+    String t = s.substring(start, i);
+    t.trim();
+    start = i + 1;
+    int c = t.indexOf(':');
+    if (c > 0 && t.substring(0, c).toInt() * 60 + t.substring(c + 1).toInt() == m) return true;
+  }
+  return false;
+}
+
+void handleTimers(uint32_t now) {
+  if (cfg.heartbeatMin > 0 && now - lastHeartbeat >= cfg.heartbeatMin * 60000UL) {
+    lastHeartbeat = now;
+    pushEvent(EV_HEARTBEAT, 0);
+  }
+  if (timeValid) {
+    uint32_t local = nowEpoch() + TZ_OFFSET_SEC;
+    long epochMin = (long)(local / 60);
+    int dayMin = (int)(epochMin % 1440);
+    if (epochMin != lastSchedMin && isSendTime(dayMin)) {
+      lastSchedMin = epochMin;
+      pushEvent(EV_SCHEDULED, 0);
+    }
+  }
+  if (ledOffAt && (int32_t)(now - ledOffAt) >= 0) { digitalWrite(STATUS_LED, LOW); ledOffAt = 0; }
+}
+
+// =======================================================================
+//                               SERIAL COMMANDS
+// =======================================================================
+void printStatus() {
+  Serial.println("----------------------------------------------");
+  Serial.println("FW " FW_VERSION "   HW ID " + hwId + "   name " + deviceName());
+  Serial.println("Registration : " + String(registered() ? "has key" : "NO key") + " - " + regStatus);
+  Serial.printf ("LAN          : chip %s, link %s, mode %s%s, drops %u\n", chipPresent ? "OK" : "MISSING",
+                 linkOn ? "UP" : "DOWN", MODES[modeIdx].name, confirmed ? " (confirmed)" : " (testing)", dropTotal);
+  Serial.println("IP           : " + (ipReady ? Ethernet.localIP().toString() : String("none")) +
+                 (usingDHCP ? " (DHCP)" : " (static)") + "   LAN MAC " + macToStr(mac));
+  Serial.printf ("Server       : %s:%u  %s\n", cfg.serverIp.toString().c_str(), cfg.serverPort, lastServerOK ? "reachable" : "NOT reachable");
+  Serial.printf ("Pulses       : %u   %s   queue %d (dropped %u)\n", (uint32_t)pulseCount, running ? "RUNNING" : "IDLE", qCount, qDropped);
+  Serial.printf ("Sent         : ok %u  failed %u  key rejected %u\n", sentOK, sentFail, authFails);
+  Serial.printf ("Filter       : short %u  fast %u  min interval %u ms  min width %u ms\n",
+                 (uint32_t)glitchShort, (uint32_t)glitchFast, (uint32_t)minIntervalMs, (uint32_t)minWidthMs);
+  Serial.println("Time         : " + (timeValid ? fmtTime(nowEpoch()) : String("not synced")) + "   cfg_ver " + String(cfg.cfgVer) + "   last cmd " + String(lastCmdId));
+  Serial.println("OTA          : " + otaLast + (wifiOtaReady ? String("   WiFi " + WiFi.localIP().toString()) : String("")));
+  Serial.println("----------------------------------------------");
+}
+
+void printSettings() {
+  Serial.println("------------- settings in flash -------------");
+  Serial.println("id      : " + (cfg.deviceId.length() ? cfg.deviceId : String("(none)")));
+  Serial.println("key     : " + (registered() ? String(cfg.deviceKey.substring(0, 6) + "...") : String("(none)")));
+  Serial.println("dhcp    : " + String(cfg.dhcp ? "on" : "off"));
+  Serial.println("ip      : " + cfg.ip.toString());
+  Serial.println("gw      : " + cfg.gw.toString());
+  Serial.println("mask    : " + cfg.mask.toString());
+  Serial.println("dns     : " + cfg.dns.toString());
+  Serial.printf ("server  : %s:%u\n", cfg.serverIp.toString().c_str(), cfg.serverPort);
+  Serial.println("mac     : " + (cfg.macStr.length() ? cfg.macStr : String(String("auto (") + macToStr(mac) + ")")));
+  Serial.println("wifi    : " + (cfg.wifiSsid.length() ? cfg.wifiSsid : String("off")));
+  Serial.printf ("counting: idle %u ms, every %u pulses, heartbeat %u min, ota %u s\n",
+                 cfg.idleTimeoutMs, cfg.sendEvery, cfg.heartbeatMin, cfg.otaCheckSec);
+  Serial.printf ("filter  : low %u ms, release %u ms, min interval %u ms\n", cfg.stableLowMs, cfg.releaseHighMs, cfg.minIntervalMs);
+  Serial.println("times   : " + cfg.sendTimes);
+  Serial.println("---------------------------------------------");
+}
+
+void setIpKey(const char* key, const String& v) {
+  IPAddress a;
+  if (!a.fromString(v)) { Serial.println("Not an IP address: " + v); return; }
+  cfgPrefs.putString(key, v);
+  Serial.printf("Saved %s = %s  (type 'reboot' to use it)\n", key, v.c_str());
+}
+
+void handleCommand(String line) {
+  line.trim();
+  if (!line.length()) return;
+  String lo = line; lo.toLowerCase();
+
+  if (lo == "i")              printStatus();
+  else if (lo == "show")      printSettings();
+  else if (lo == "register")  { if (linkOn && ipReady) sayHello(); else Serial.println("LAN not ready"); }
+  else if (lo == "c")         { portENTER_CRITICAL(&pulseMux); pulseCount++; lastPulseMs = millis(); hadPulse = true; portEXIT_CRITICAL(&pulseMux); Serial.println("Simulated pulse"); }
+  else if (lo == "s")         pushEvent(EV_HEARTBEAT, 0);
+  else if (lo == "r")         doResetCount();
+  else if (lo == "d")         { clearFilterStats(); Serial.println("Filter stats cleared"); }
+  else if (lo == "u")         checkOTA(true);
+  else if (lo == "n")         { scanStartIdx = modeIdx; nextMode("manual"); }
+  else if (lo == "f")         { healthRequired = true; scanStartIdx = 0; applyMode(0); }
+  else if (lo == "reboot")    { saveCount(true); Serial.println("Restarting..."); delay(200); ESP.restart(); }
+  else if (lo == "factory")   {
+    cfgPrefs.clear();
+    Serial.println("All settings erased (ID, key, network). Pulse count kept. Restarting...");
+    delay(300); ESP.restart();
+  }
+  else if (lo.startsWith("set ")) {
+    String rest = line.substring(4); rest.trim();
+    int sp = rest.indexOf(' ');
+    String what = (sp > 0 ? rest.substring(0, sp) : rest); what.toLowerCase();
+    String val  = (sp > 0 ? rest.substring(sp + 1) : String("")); val.trim();
+    if (what == "id")        { cfgPrefs.putString("id", val); cfg.deviceId = val; Serial.println("Saved id " + val); }
+    else if (what == "key")  { cfgPrefs.putString("key", val); cfg.deviceKey = val; authFails = 0; Serial.println("Saved key"); }
+    else if (what == "ip" || what == "gw" || what == "mask" || what == "dns") setIpKey(what.c_str(), val);
+    else if (what == "dhcp") { bool on = val == "on"; cfgPrefs.putBool("dhcp", on); Serial.printf("DHCP %s  (type 'reboot')\n", on ? "on" : "off"); }
+    else if (what == "server") {
+      int c = val.indexOf(':');
+      String ip = c > 0 ? val.substring(0, c) : val;
+      uint16_t port = c > 0 ? (uint16_t)val.substring(c + 1).toInt() : DEF_SERVER_PORT;
+      IPAddress a;
+      if (!a.fromString(ip) || port == 0) { Serial.println("Use: set server 10.5.20.2:5000"); return; }
+      cfgPrefs.putString("srv", ip); cfgPrefs.putUShort("port", port);
+      cfg.serverIp = a; cfg.serverPort = port;
+      Serial.printf("Server %s:%u saved\n", ip.c_str(), port);
+    }
+    else if (what == "mac") {
+      byte m[6];
+      if (val == "auto") { cfgPrefs.remove("mac"); Serial.println("MAC = chip MAC  (type 'reboot')"); }
+      else if (strToMac(val, m)) { cfgPrefs.putString("mac", val); Serial.println("MAC saved  (type 'reboot')"); }
+      else Serial.println("Use: set mac AA:BB:CC:DD:EE:FF  or  set mac auto");
+    }
+    else if (what == "wifi") {
+      if (val == "off") { cfgPrefs.remove("wssid"); cfgPrefs.remove("wpass"); Serial.println("WiFi off  (type 'reboot')"); }
+      else {
+        int s2 = val.indexOf(' ');
+        String ssid = s2 > 0 ? val.substring(0, s2) : val;
+        String pass = s2 > 0 ? val.substring(s2 + 1) : String("");
+        cfgPrefs.putString("wssid", ssid); cfgPrefs.putString("wpass", pass);
+        Serial.println("WiFi " + ssid + " saved  (type 'reboot')");
+      }
+    }
+    else Serial.println("Unknown setting: " + what);
+  }
+  else Serial.println("Commands: i, show, register, c, s, r, d, u, n, f, set ..., reboot, factory");
+}
+
+void handleSerial() {
+  while (Serial.available()) {
+    char ch = (char)Serial.read();
+    if (ch == '\n' || ch == '\r') { if (serialLine.length()) { handleCommand(serialLine); serialLine = ""; } }
+    else if (serialLine.length() < 120) serialLine += ch;
+  }
+}
+
+// =======================================================================
+//                               SETUP / LOOP
+// =======================================================================
+void setupWatchdog() {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  esp_task_wdt_config_t wc = { WDT_TIMEOUT_S * 1000, 0, true };
+  if (esp_task_wdt_init(&wc) != ESP_OK) esp_task_wdt_reconfigure(&wc);
+#else
+  esp_task_wdt_init(WDT_TIMEOUT_S, true);
+#endif
+  esp_task_wdt_add(NULL);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+  setupWatchdog();
+  pinMode(STATUS_LED, OUTPUT);
+  digitalWrite(STATUS_LED, LOW);
+
+  uint8_t f[6];
+  esp_read_mac(f, ESP_MAC_WIFI_STA);                 // factory MAC = permanent HW ID
+  hwId = macToStr(f);
+
+  loadConfig();
+  setupMac();
+
+  prefs.begin("machine", false);
+  seqNo           = prefs.getUInt("seq", 0);
+  pulseCount      = prefs.getUInt("pulses", 0);
+  lastCmdId       = prefs.getUInt("cmd", 0);
+  modeIdx         = prefs.getUChar("phymode", 0);
+  if (modeIdx < 0 || modeIdx >= NUM_MODES) modeIdx = 0;
+  scanStartIdx    = modeIdx;
+  lastSavedPulses = lastSeenPulses = pulseCount;
+  lastBlock       = pulseCount / cfg.sendEvery;
+
+  Serial.println();
+  Serial.println("==============================================");
+  Serial.println(" MACHINE MONITOR  universal firmware " FW_VERSION);
+  Serial.println(" HW ID   : " + hwId);
+  Serial.println(" LAN MAC : " + macToStr(mac));
+  Serial.println(" Name    : " + deviceName());
+  Serial.println(" Status  : " + (registered() ? String("registered as ") + cfg.deviceId : String("NOT registered - will ask the server")));
+  Serial.printf (" Server  : %s:%u   pulses %u\n", cfg.serverIp.toString().c_str(), cfg.serverPort, (uint32_t)pulseCount);
+  Serial.println("==============================================");
+
+  // W5500: hardware reset, SPI
+  pinMode(PIN_CS, OUTPUT);
+  digitalWrite(PIN_CS, HIGH);
+  pinMode(PIN_RST, OUTPUT);
+  digitalWrite(PIN_RST, LOW);
+  delay(50);
+  digitalWrite(PIN_RST, HIGH);
+  delay(300);
+  SPI.begin(PIN_SCK, PIN_MISO, PIN_MOSI, PIN_CS);
+  Ethernet.init(PIN_CS);
+
+  chipPresent = chipOK();
+  if (chipPresent) applyMode(modeIdx);
+  else Serial.println("[LAN] W5500 not found - check wiring");
+
+  startSensor();
+  idleSince = millis();
+  lastHeartbeat = millis();
+  pushEvent(EV_BOOT, 0);
+  Serial.println("Type 'i' for status, 'show' for settings.");
+}
+
+void loop() {
+  feedWdt();
+  uint32_t now = millis();
+  handleSerial();
+  handleLan(now);
+  handleCounting(now);
+  handleTimers(now);
+  handleRegistration(now);
+  fetchConfig(now);
+  processQueue();
+  handleOTA(now);
+  handleWifi(now);
+  delay(1);
+}
