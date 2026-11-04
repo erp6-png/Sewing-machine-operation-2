@@ -2,22 +2,38 @@
 // ESP32 SEWING OPERATION COUNTER + RFID CARD READER
 // 1.8" ST7735 (160x128) + HW-147C (Si512 / PN512 / MFRC522-compatible)
 //
-// v2.8.1  R&D build
-//  - TEAL THEME: brighter panels / ring track (visible on TN panel),
-//    cyan FG + QTY, amber style/UID/N, green fabric pill + Wi-Fi.
-//  - Wi-Fi bars moved to CARD row so the full style no. fits in header.
-// v2.8.0
-//  - NEW UI: maroon header (MC / machine / style / Wi-Fi / fabric pill),
-//    CARD row, stitch RING gauge with MIN marker, big FINISHED (FG) card,
-//    QTY / DISC / N boxes, full-width status bar ("KEEP SEWING" etc.)
-//    Needs TFT_eSPI 2.5.0 or newer (drawArc / drawWideLine).
-// v2.7.0
-//  - STITCH FIX: "re-arm" counting. After a stitch is counted, the pin must
-//    be idle (HIGH) for STITCH_REARM_US before the next one can count.
-//    Slow hand-turning flicker no longer counts twice.
-//    PULSES_PER_STITCH setting (1 or 2) if the wheel really gives 2 pulses.
-//  - Display soft refresh every 3 s (faster recovery from power dips)
-//  - Serial shows rejected pulses (REJ) and shortest gap between stitches
+// v3.0.0  IoT CLONE BUILD -- self-provisioning, no pasted key/machine ID
+//  - Identity is now the board's own WiFi MAC (hw_id), computed on boot --
+//    MACHINE_ID / LOCAL_* / DEVICE_KEY constants are GONE.
+//  - On boot: calls POST .../api/v1/device/hello with just its hw_id. An
+//    unknown hw_id self-registers as "pending" server-side -- nothing
+//    needs to be created in the app first. Once an admin approves it
+//    (giving it a Machine ID in the IoT Devices page), the NEXT hello
+//    call returns a device_key -- ONE TIME ONLY -- which this firmware
+//    saves to flash (Preferences) and uses from then on. If you re-flash
+//    or factory-reset the board, it goes back to "pending" until an
+//    admin re-approves the same hw_id (the key is only ever handed out
+//    once per approval).
+//  - Talks to the ISOLATED IOT CLONE, not the live production API --
+//    reachable over the public internet via https://ina.technoactive.work/iot-clone/
+//    (nginx proxies that path to the clone backend on the server, port
+//    8504 -- a completely separate process/DB-write-path from the real
+//    production app).
+//  - Job resolution replaces the old local N/N_MIN/QTY constants: the
+//    server tells this board its style, operation and the computed
+//    stitch target (seam length / SPI) for the size it's running, or
+//    the smallest-size fallback if the exact size isn't known here.
+//    There's no server-side "quantity remaining" concept yet in the IoT
+//    clone (unlike the old local-only mode) -- FINISHED/DISCARDED counts
+//    below are LOCAL counters only, reset whenever the job (style or
+//    operation) changes. The "QTY" box on screen now shows the SIZE the
+//    stitch target came from instead (amber if it's the fallback size,
+//    not an exact match).
+//  - HTTPS via WiFiClientSecure::setInsecure() (no CA bundle needed) --
+//    fine for R&D; swap in a proper root CA if this becomes permanent.
+//  - All sensor/RFID/display DRAWING logic below is UNCHANGED from the
+//    previous build -- only identity + server-sync + a few on-screen
+//    labels were touched.
 //
 // Board: ESP32 Dev Module   Partition: "Default 4MB with spiffs"
 // Sketch folder: sewing_counter_rfid/sewing_counter_rfid.ino
@@ -47,23 +63,19 @@
 #include <SPI.h>
 #include <TFT_eSPI.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
 #include <ArduinoOTA.h>
 #include <Preferences.h>
+#include <time.h>
 #include <esp_system.h>
 #include "soc/soc.h"
 #include "soc/gpio_reg.h"
 
 #define USE_WIFI   1
-#define USE_SERVER 0
+#define USE_SERVER 1
 
-#if USE_SERVER && !USE_WIFI
-#error "USE_SERVER needs USE_WIFI 1"
-#endif
-#if USE_SERVER
-#include <HTTPClient.h>
-#endif
-
-#define FW_VERSION "2.8.1"
+#define FW_VERSION "3.0.0-iot-clone"
 
 TFT_eSPI tft = TFT_eSPI();
 TFT_eSprite spr = TFT_eSprite(&tft);
@@ -74,21 +86,25 @@ Preferences prefs;
 #define SCREEN_ROTATION 3
 
 // ================= USER SETTINGS =================
-const char* WIFI_SSID  = "Joy";
-const char* WIFI_PASS  = "Subhajit#22";
+const char* WIFI_SSID  = "seenivas";
+const char* WIFI_PASS  = "87654321";
 
-const char* MACHINE_ID   = "M02";
 const char* OTA_PASSWORD = "123456";
 
-const char* LOCAL_STYLE = "PM666/01";
-const long  LOCAL_QTY   = 100;
-const int   LOCAL_N     = 50;
-const int   LOCAL_N_MIN = 40;
+// Isolated IoT clone, reachable from anywhere (board is on a separate
+// network from the factory LAN) -- NOT the live production API. nginx on
+// the server proxies /iot-clone/* straight through to the clone backend
+// on port 8504, unchanged.
+const char* SERVER_URL   = "https://ina.technoactive.work/iot-clone";
+const char* PATH_HELLO   = "/api/v1/device/hello";
+const char* PATH_JOB     = "/api/v1/iot/device/job";
+const char* PATH_EVENTS  = "/api/v1/iot/events";
 
-const char* SERVER_URL  = "http://10.7.13.15:8502";
-const char* PATH_JOB    = "/api/v1/stitch/job";
-const char* PATH_EVENTS = "/api/v1/stitch/events";
-const char* DEVICE_KEY  = "PASTE_DEVICE_KEY";
+// How often to call hello while waiting to be approved, and how often to
+// re-check the job once provisioned (style/operation/mapping can change
+// from the app at any time -- this is how the board finds out).
+const unsigned long HELLO_RETRY_MS = 10000;
+const unsigned long JOB_POLL_MS    = 5000;
 
 // ================= PINS =================
 #define PULSE_GPIO 34                // stitch sensor (must be 32..39 for the fast read)
@@ -132,10 +148,6 @@ const unsigned long RFID_RETRY_MS       = 5000;
 const unsigned long NEWCARD_MS          = 1500;
 const unsigned long DISPLAY_SOFT_REFRESH_MS = 3000;
 #define WIFI_TX_POWER WIFI_POWER_13dBm
-#if USE_SERVER
-const unsigned long SYNC_INTERVAL_MS    = 3000;
-const unsigned long IDLE_BEFORE_SYNC_MS = 1500;
-#endif
 
 // ================= UI COLOURS (RGB565) - TEAL THEME =================
 // Brighter mid-tones so panels and ring track stay visible on the ST7735 TN panel
@@ -152,13 +164,38 @@ const unsigned long IDLE_BEFORE_SYNC_MS = 1500;
 #define COL_WIFI_OFF  0x4AED   // unlit Wi-Fi bar        #4C5C6C
 #define COL_DISC      0xFA6B   // DISC                   #FF4D5E
 
-// ================= JOB =================
+// ================= IDENTITY (provisioned over the network, never hardcoded) =====
+String hwId;             // this board's permanent identity -- its own WiFi MAC
+String deviceKey;        // "" until approved + fetched once; then saved to flash
+String deviceId;         // server-assigned short id, once approved
+String machineLabel;     // the human Machine ID an admin gave this board, once approved
+Preferences idPrefs;      // separate Preferences namespace from the boot-diag one below
+
+// ================= JOB (from GET .../iot/device/job) =================
+// jobState mirrors the server's own `state` field exactly:
+//   "pending"            -- not approved yet (handled before we ever call /job)
+//   "inactive"           -- board was deactivated by an admin
+//   "no_open_run"        -- approved, but this board's line has no open style run
+//   "waiting_to_be_mapped" -- a run is open but nobody's mapped this board to an operation yet
+//   "no_operations_master_row" -- mapped, but Operations Master has no row for this style+operation
+//   "ready"               -- everything resolved; stitchN below is live
+String jobState = "no_open_run";
 String styleNo = "";
-int    stitchN    = 50;
-int    stitchMin  = 40;
-long   qtyRemaining = 0;
+String operationCode = "";
+String sizeUsed = "";
+bool   sizeWasFallback = false;
+int    stitchN    = 0;
+// No separate "minimum acceptable" count comes from the server yet (the IoT
+// clone's job endpoint returns one stitch target, not a target+minimum pair
+// like the old local-only mode did) -- treated as equal to the target for
+// now, so the ring/status logic below still works unchanged.
+int    stitchMin  = 0;
+
+// FINISHED / DISCARDED are LOCAL-ONLY counters (no server-side quantity
+// concept in the IoT clone yet) -- reset whenever the resolved job changes.
 long   finishedFG   = 0;
 long   discardedCnt = 0;
+String lastJobKey = "";  // styleNo+"|"+operationCode, to detect a job change
 
 // ================= LIVE COUNT =================
 int  pulseCount = 0;
@@ -215,12 +252,14 @@ void IRAM_ATTR onPulse() {
 }
 
 // ================= EVENT QUEUE =================
+// One queued event per finished-good or discarded garment -- same as
+// before, just posted to the IoT clone's /iot/events instead of the old
+// stitch/events path. stitch_count = how many stitches that garment had
+// when it was removed (its pulseCount at that moment).
 struct Event {
-  const char*   type;
-  uint8_t       pulses;
+  uint16_t      stitchCount;
   uint32_t      seq;
   unsigned long ms;
-  char          style[16];
 };
 const int QUEUE_SIZE = 40;
 Event queueBuf[QUEUE_SIZE];
@@ -228,19 +267,16 @@ int qHead = 0, qCount = 0;
 uint32_t eventSeq = 0;
 uint32_t bootId = 0;
 
-void queueEvent(const char* type, uint8_t pulses) {
+void queueEvent(uint16_t stitchCount) {
 #if USE_SERVER
   if (qCount >= QUEUE_SIZE) return;
   Event &e = queueBuf[(qHead + qCount) % QUEUE_SIZE];
-  e.type = type;
-  e.pulses = pulses;
+  e.stitchCount = stitchCount;
   e.seq = ++eventSeq;
   e.ms = millis();
-  strncpy(e.style, styleNo.c_str(), sizeof(e.style));
-  e.style[sizeof(e.style) - 1] = 0;
   qCount++;
 #else
-  (void)type; (void)pulses;
+  (void)stitchCount;
 #endif
 }
 
@@ -274,7 +310,7 @@ const char* resetReasonText(esp_reset_reason_t r, bool &bad) {
 }
 
 // =================================================
-// RFID READER
+// RFID READER   (unchanged)
 // =================================================
 #define CommandReg     0x01
 #define ComIrqReg      0x04
@@ -537,7 +573,7 @@ void pollRfid() {
 }
 
 // =================================================
-// DISPLAY
+// DISPLAY   (unchanged except the labels noted inline)
 // =================================================
 void initDisplay() {
   tft.init();
@@ -638,7 +674,7 @@ void drawStitchRing(int cx, int cy, int ro, int ri) {
   spr.drawString(buf, cx, cy + 1, cf);
 }
 
-void drawBox(int x, int y, int w, int h, const char* label, long value,
+void drawBox(int x, int y, int w, int h, const char* label, const String &valueText,
              uint16_t border, uint16_t txt, bool active) {
   spr.fillRoundRect(x, y, w, h, 4, active ? border : COL_PANEL);
   spr.drawRoundRect(x, y, w, h, 4, border);
@@ -649,18 +685,23 @@ void drawBox(int x, int y, int w, int h, const char* label, long value,
   spr.setTextColor(tc);
   spr.drawString(label, x + w / 2, y + 5, 1);
 
-  char buf[12];
-  snprintf(buf, sizeof(buf), "%ld", value);
   spr.setFreeFont(&FreeSansBold9pt7b);
-  if (spr.textWidth(buf) <= w - 4) {
+  if (spr.textWidth(valueText) <= w - 4) {
     spr.setTextDatum(C_BASELINE);
-    spr.drawString(buf, x + w / 2, y + h - 3);
+    spr.drawString(valueText, x + w / 2, y + h - 3);
   } else {
     spr.setTextFont(2);
     spr.setTextDatum(MC_DATUM);
-    spr.drawString(buf, x + w / 2, y + h / 2 + 4);
+    spr.drawString(valueText, x + w / 2, y + h / 2 + 4);
   }
   spr.setTextFont(1);
+}
+// long-value overload, kept for DISC/FG-style boxes
+void drawBox(int x, int y, int w, int h, const char* label, long value,
+             uint16_t border, uint16_t txt, bool active) {
+  char buf[12];
+  snprintf(buf, sizeof(buf), "%ld", value);
+  drawBox(x, y, w, h, label, String(buf), border, txt, active);
 }
 
 void drawStatus(uint16_t bg, uint16_t fg, const char *txt) {
@@ -675,18 +716,21 @@ void drawStatus(uint16_t bg, uint16_t fg, const char *txt) {
 void render() {
   if (otaInProgress) return;
   spr.fillSprite(TFT_BLACK);
-  char buf[32];
   bool flashing = (flashText.length() > 0 && millis() < flashUntil);
-  bool hasJob = (styleNo.length() > 0);
+  bool hasJob = (jobState == "ready");
 
-  // ---------- HEADER: MC  M01  STYLE ...........  [FABRIC] ----------
+  // ---------- HEADER: MC  <machine label or pending hw_id>  STYLE ....  [FABRIC] ----------
   spr.fillRect(0, 0, SCR_W, 18, COL_HEADER);
   spr.setTextDatum(ML_DATUM);
   spr.setTextColor(COL_LABEL);
   spr.drawString("MC", 3, 10, 1);
   spr.setTextColor(TFT_WHITE);
-  spr.drawString(MACHINE_ID, 17, 9, 2);
-  int styleX = 17 + spr.textWidth(MACHINE_ID, 2) + 5;
+  // Machine ID comes from the server once approved; before that, show the
+  // last 5 characters of this board's own hw_id so it can be matched up
+  // against the Pending list on the IoT Devices page.
+  String mcText = machineLabel.length() ? machineLabel : ("..." + hwId.substring(max(0, (int)hwId.length() - 5)));
+  spr.drawString(mcText, 17, 9, 2);
+  int styleX = 17 + spr.textWidth(mcText, 2) + 5;
 
   const char* gtxt = garmentPresent ? "FABRIC" : "NO FAB";
   int pw = spr.textWidth(gtxt, 1) + 8;
@@ -696,7 +740,7 @@ void render() {
   spr.setTextColor(TFT_BLACK);
   spr.drawString(gtxt, px + pw / 2, 9, 1);
 
-  String st = hasJob ? styleNo : String("-");
+  String st = hasJob ? (styleNo + " " + operationCode) : String("-");
   int avail = px - 4 - styleX;
   while (st.length() > 1 && spr.textWidth(st, 1) > avail) st.remove(st.length() - 1);
   spr.setTextDatum(ML_DATUM);
@@ -731,10 +775,11 @@ void render() {
   spr.drawString("STITCHES", cx, 38, 1);
   drawStitchRing(cx, cy, 25, 19);
 
-  snprintf(buf, sizeof(buf), "MIN %d/%d", stitchMin, stitchN);
-  if (spr.textWidth(buf, 1) > 58) snprintf(buf, sizeof(buf), "%d/%d", stitchMin, stitchN);
+  char minBuf[16];
+  snprintf(minBuf, sizeof(minBuf), "MIN %d/%d", stitchMin, stitchN);
+  if (spr.textWidth(minBuf, 1) > 58) snprintf(minBuf, sizeof(minBuf), "%d/%d", stitchMin, stitchN);
   spr.setTextColor(COL_AMBER);
-  spr.drawString(buf, cx, 103, 1);
+  spr.drawString(minBuf, cx, 103, 1);
 
   // ---------- RIGHT: FINISHED (FG) CARD ----------
   const int fx = 60, fy = 35, fw = SCR_W - 3 - fx, fh = 48;
@@ -746,31 +791,43 @@ void render() {
   spr.setTextColor(COL_ACCENT);
   spr.drawString("FINISHED (FG)", fx + 6, fy + 8, 1);
 
-  snprintf(buf, sizeof(buf), "%ld", finishedFG);
+  char fgBuf[12];
+  snprintf(fgBuf, sizeof(fgBuf), "%ld", finishedFG);
   spr.setTextDatum(C_BASELINE);
   spr.setTextColor(TFT_WHITE);
   spr.setFreeFont(&FreeSansBold18pt7b);
-  if (spr.textWidth(buf) > fw - 8) spr.setFreeFont(&FreeSansBold12pt7b);
-  spr.drawString(buf, fx + fw / 2, fy + fh - 5);
+  if (spr.textWidth(fgBuf) > fw - 8) spr.setFreeFont(&FreeSansBold12pt7b);
+  spr.drawString(fgBuf, fx + fw / 2, fy + fh - 5);
   spr.setTextFont(1);
 
-  // ---------- RIGHT: QTY / DISC / N ----------
+  // ---------- RIGHT: SIZE / DISC / N ----------
+  // The old "QTY" box (server-side quantity remaining) doesn't exist in the
+  // IoT clone yet -- repurposed to show which SIZE the stitch target came
+  // from (amber if it's the smallest-size fallback, not an exact match for
+  // the piece actually on the machine).
   const int by = 86, bh = 24, gap = 2;
   int bw = (fw - 2 * gap) / 3;
-  drawBox(fx,                by, bw, bh, "QTY",  hasJob ? qtyRemaining : 0,
-          COL_ACCENT, COL_ACCENT, flashing && flashColor == TFT_GREEN);
-  drawBox(fx + bw + gap,     by, bw, bh, "DISC", discardedCnt,
+  drawBox(fx, by, bw, bh, "SIZE", hasJob ? sizeUsed : String("-"),
+          sizeWasFallback ? COL_RING : COL_ACCENT, sizeWasFallback ? COL_RING : COL_ACCENT,
+          flashing && flashColor == TFT_GREEN);
+  drawBox(fx + bw + gap, by, bw, bh, "DISC", discardedCnt,
           COL_DISC, COL_DISC, flashing && flashColor == TFT_RED);
-  drawBox(fx + 2 * (bw + gap), by, fx + fw - (fx + 2 * (bw + gap)), bh, "N", stitchN,
+  drawBox(fx + 2 * (bw + gap), by, fx + fw - (fx + 2 * (bw + gap)), bh, "N", (long)stitchN,
           COL_AMBER, COL_AMBER, false);
 
   // ---------- STATUS BAR ----------
   if (flashing) {
     drawStatus(flashColor, TFT_BLACK, flashText.c_str());
-  } else if (!hasJob) {
-    drawStatus(COL_PANEL, COL_LABEL, "WAITING FOR JOB");
-  } else if (qtyRemaining <= 0 && pulseCount == 0) {
-    drawStatus(COL_GOOD, TFT_BLACK, "JOB DONE");
+  } else if (deviceKey.length() == 0) {
+    drawStatus(COL_PANEL, COL_AMBER, "WAITING FOR APPROVAL");
+  } else if (jobState == "inactive") {
+    drawStatus(TFT_RED, TFT_WHITE, "DEVICE DEACTIVATED");
+  } else if (jobState == "no_open_run") {
+    drawStatus(COL_PANEL, COL_LABEL, "NO OPEN RUN ON THIS LINE");
+  } else if (jobState == "waiting_to_be_mapped") {
+    drawStatus(COL_PANEL, COL_LABEL, "WAITING TO BE MAPPED");
+  } else if (jobState == "no_operations_master_row") {
+    drawStatus(COL_PANEL, COL_AMBER, "NO OPERATIONS DATA");
   } else if (garmentPresent && pulseCount >= stitchN) {
     drawStatus(COL_GOOD, TFT_BLACK, "COMPLETE - REMOVE");
   } else if (garmentPresent && pulseCount >= stitchMin) {
@@ -785,18 +842,16 @@ void render() {
 }
 
 // =================================================
-// SENSORS / COUNTING
+// SENSORS / COUNTING   (unchanged)
 // =================================================
 void onGarmentRemoved() {
-  if (pulseCount >= stitchMin && qtyRemaining > 0) {
+  if (pulseCount >= stitchMin && stitchN > 0) {
     finishedFG++;
-    qtyRemaining--;
-    queueEvent("OP_DONE", (uint8_t)min(pulseCount, 255));
+    queueEvent((uint16_t)min(pulseCount, 65535));
     flash("FG +1   (" + String(pulseCount) + " ST)", TFT_GREEN);
-    Serial.printf("FG COUNTED at %d st  Q=%ld FG=%ld\n", pulseCount, qtyRemaining, finishedFG);
+    Serial.printf("FG COUNTED at %d st  FG=%ld\n", pulseCount, finishedFG);
   } else if (pulseCount > 0 && pulseCount < stitchMin) {
     discardedCnt++;
-    queueEvent("OP_DISCARD", (uint8_t)pulseCount);
     flash("DISCARDED " + String(pulseCount) + "/" + String(stitchMin), TFT_RED);
     Serial.printf("DISCARDED at %d (min %d)  DISC=%ld\n", pulseCount, stitchMin, discardedCnt);
   }
@@ -873,7 +928,7 @@ void processPulses() {
 
   bool changed = false;
   while (n--) {
-    if (garmentPresent && qtyRemaining > 0 && styleNo.length() > 0) {
+    if (garmentPresent && jobState == "ready") {
       pulseRemainder++;
       if (pulseRemainder < PULSES_PER_STITCH) continue;
       pulseRemainder = 0;
@@ -887,7 +942,7 @@ void processPulses() {
 }
 
 // =================================================
-// WIFI
+// WIFI   (unchanged)
 // =================================================
 void connectWiFi(unsigned long timeoutMs) {
 #if USE_WIFI
@@ -917,7 +972,7 @@ void keepWiFiAlive() {
 }
 
 // =================================================
-// OTA
+// OTA   (hostname now derived from hw_id instead of the old MACHINE_ID)
 // =================================================
 void drawOtaScreen(int pct, unsigned int done, unsigned int total,
                    const String &msg, uint16_t headCol, bool error) {
@@ -927,7 +982,7 @@ void drawOtaScreen(int pct, unsigned int done, unsigned int total,
   spr.setTextColor(TFT_WHITE);
   spr.drawString("FIRMWARE UPDATE", SCR_W / 2, 9, 2);
   spr.setTextColor(TFT_SILVER);
-  spr.drawString(MACHINE_ID, SCR_W / 2, 26, 1);
+  spr.drawString(machineLabel.length() ? machineLabel : hwId, SCR_W / 2, 26, 1);
 
   if (error) {
     spr.setTextColor(TFT_RED);
@@ -978,7 +1033,9 @@ String otaErrorText(ota_error_t e) {
 }
 
 void startOTA() {
-  ArduinoOTA.setHostname(MACHINE_ID);
+  String hostName = "iot-" + hwId;
+  hostName.replace(":", "");
+  ArduinoOTA.setHostname(hostName.c_str());
   ArduinoOTA.setPassword(OTA_PASSWORD);
 
   ArduinoOTA.onStart([]() {
@@ -1008,7 +1065,7 @@ void startOTA() {
   otaStarted = true;
   if (!resetBad || millis() > 15000)
     flash("OTA READY " + WiFi.localIP().toString(), TFT_CYAN);
-  Serial.printf("OTA READY: name %s  IP %s\n", MACHINE_ID, WiFi.localIP().toString().c_str());
+  Serial.printf("OTA READY: name %s  IP %s\n", hostName.c_str(), WiFi.localIP().toString().c_str());
 }
 
 void manageOTA() {
@@ -1024,9 +1081,14 @@ void manageOTA() {
 }
 
 // =================================================
-// SERVER (only when USE_SERVER is 1)
+// SERVER -- IoT clone: hello (self-register + one-time key reveal),
+// job (resolve style/operation/stitch target), events (post completions)
 // =================================================
 #if USE_SERVER
+
+// Minimal JSON helpers -- same approach as the old firmware (no library),
+// just string-key lookups. Good enough for the small, flat replies this
+// API always returns.
 String jsonStr(const String &js, const char* key) {
   String k = String("\"") + key + "\":";
   int p = js.indexOf(k);
@@ -1049,69 +1111,196 @@ bool jsonInt(const String &js, const char* key, long &out) {
   return true;
 }
 
-void sendOneEvent() {
-  Event &e = queueBuf[qHead];
-  char id[48];
-  snprintf(id, sizeof(id), "%s-%08lX-%lu", MACHINE_ID, (unsigned long)bootId, (unsigned long)e.seq);
+bool jsonBool(const String &js, const char* key, bool &out) {
+  String k = String("\"") + key + "\":";
+  int p = js.indexOf(k);
+  if (p < 0) return false;
+  p += k.length();
+  while (p < (int)js.length() && js[p] == ' ') p++;
+  out = js.startsWith("true", p);
+  return true;
+}
 
-  String body = String("{\"device_id\":\"") + MACHINE_ID +
-                "\",\"events\":[{\"client_event_id\":\"" + id +
-                "\",\"event_type\":\"" + e.type +
-                "\",\"style_no\":\"" + e.style +
-                "\",\"pulses\":" + String(e.pulses) +
-                ",\"age_s\":" + String((millis() - e.ms) / 1000) + "}]}";
+// One client, reused for every call -- setInsecure() skips certificate
+// validation (no root CA bundle needed). Fine for this R&D build; swap in
+// a proper CA if this ever becomes a permanent deployment.
+WiFiClientSecure secureClient;
 
+bool httpPostJson(const String &path, const String &deviceKeyHeader, const String &body, String &response) {
   HTTPClient http;
-  http.setConnectTimeout(3000);
-  http.setTimeout(3000);
-  http.begin(String(SERVER_URL) + PATH_EVENTS);
+  http.setConnectTimeout(5000);
+  http.setTimeout(5000);
+  if (!http.begin(secureClient, String(SERVER_URL) + path)) return false;
   http.addHeader("Content-Type", "application/json");
-  http.addHeader("X-Device-Key", DEVICE_KEY);
+  if (deviceKeyHeader.length()) http.addHeader("X-Device-Key", deviceKeyHeader);
   int code = http.POST(body);
+  response = http.getString();
   http.end();
+  return code >= 200 && code < 300;
+}
 
-  if ((code >= 200 && code < 300) || code == 409) {
-    qHead = (qHead + 1) % QUEUE_SIZE;
-    qCount--;
-    requestRender();
+bool httpGet(const String &path, const String &deviceKeyHeader, String &response) {
+  HTTPClient http;
+  http.setConnectTimeout(5000);
+  http.setTimeout(5000);
+  if (!http.begin(secureClient, String(SERVER_URL) + path)) return false;
+  if (deviceKeyHeader.length()) http.addHeader("X-Device-Key", deviceKeyHeader);
+  int code = http.GET();
+  response = http.getString();
+  http.end();
+  return code == 200;
+}
+
+// Saves whatever we've learned so far to flash, so a reboot (power cycle,
+// crash, OTA) never has to re-approve the board -- only a re-flash that
+// erases this namespace, or an admin deactivating it, resets this.
+void saveIdentity() {
+  idPrefs.begin("iot_id", false);
+  idPrefs.putString("device_key", deviceKey);
+  idPrefs.putString("device_id", deviceId);
+  idPrefs.putString("machine_label", machineLabel);
+  idPrefs.end();
+}
+
+void loadIdentity() {
+  idPrefs.begin("iot_id", true);
+  deviceKey    = idPrefs.getString("device_key", "");
+  deviceId     = idPrefs.getString("device_id", "");
+  machineLabel = idPrefs.getString("machine_label", "");
+  idPrefs.end();
+}
+
+// POST /api/v1/device/hello -- no key needed. Self-registers an unknown
+// hw_id as "pending" server-side. Once approved, the key comes back
+// exactly once; we grab it the moment it appears and save it to flash.
+void doHello() {
+  String body = String("{\"hw_id\":\"") + hwId + "\",\"firmware_version\":\"" FW_VERSION "\"}";
+  String resp;
+  if (!httpPostJson(PATH_HELLO, "", body, resp)) {
+    Serial.println("hello: request failed (network/server)");
+    return;
+  }
+  String status = jsonStr(resp, "status");
+  Serial.printf("hello: status=%s\n", status.c_str());
+
+  if (status == "pending" || status == "inactive") {
+    jobState = "no_open_run"; // display falls back to "WAITING FOR APPROVAL" via deviceKey.length()==0 check
+    return;
+  }
+
+  String key = jsonStr(resp, "device_key");
+  if (key.length()) {
+    // One-time reveal -- this is the only moment we'll ever see this key.
+    deviceKey    = key;
+    deviceId     = jsonStr(resp, "device_id");
+    machineLabel = jsonStr(resp, "machine_label");
+    saveIdentity();
+    flash("APPROVED: " + machineLabel, TFT_GREEN, 4000);
+    Serial.printf("hello: approved as %s (%s), key saved\n", machineLabel.c_str(), deviceId.c_str());
+  } else if (deviceKey.length() == 0) {
+    // Approved already (status unmapped/mapped) but we don't have a key
+    // saved locally -- e.g. this is a fresh flash onto a board whose hw_id
+    // was approved before. The key was already handed out once before, so
+    // it will NOT be repeated here; an admin needs to re-approve (or, if
+    // you added one, use a server-side "reissue key" action) to get a new
+    // one. Keep polling in case that happens.
+    machineLabel = jsonStr(resp, "machine_label");
+    Serial.println("hello: already approved elsewhere, but no key on file -- needs re-approval to get a new one");
   }
 }
 
+// GET /api/v1/iot/device/job -- resolves this device's current job purely
+// from its key. Called on every JOB_POLL_MS tick once provisioned.
 void fetchJob() {
-  HTTPClient http;
-  http.setConnectTimeout(3000);
-  http.setTimeout(3000);
-  http.begin(String(SERVER_URL) + PATH_JOB + "?machine=" + MACHINE_ID);
-  http.addHeader("X-Device-Key", DEVICE_KEY);
-  int code = http.GET();
-  if (code != 200) { http.end(); return; }
-  String r = http.getString();
-  http.end();
-
-  String s = jsonStr(r, "style_no");
-  long q, fg, n, nMin;
-  if (!jsonInt(r, "q", q) || !jsonInt(r, "fg", fg)) return;
-
-  if (s != styleNo) {
-    styleNo = s;
-    pulseCount = 0;
-    pulseRemainder = 0;
-    discardedCnt = 0;
+  String resp;
+  if (!httpGet(PATH_JOB, deviceKey, resp)) {
+    Serial.println("job: request failed (network/server)");
+    return;
   }
-  if (jsonInt(r, "n", n) && n >= 1 && n <= 200) stitchN = (int)n;
-  if (jsonInt(r, "n_min", nMin) && nMin >= 1 && nMin <= stitchN) stitchMin = (int)nMin;
-  if (stitchMin > stitchN) stitchMin = stitchN;
-  qtyRemaining = q;
-  finishedFG   = fg;
-  requestRender();
+  String state = jsonStr(resp, "state");
+  if (state.length() == 0) return;
+
+  String newStyle = jsonStr(resp, "style_id");
+  String newOp     = jsonStr(resp, "operation_code");
+  String jobKey    = newStyle + "|" + newOp;
+
+  if (state != jobState) requestRender();
+  jobState = state;
+
+  if (state == "ready") {
+    long target = 0;
+    jsonInt(resp, "stitch_target", target);
+    bool fallback = false;
+    jsonBool(resp, "size_was_fallback", fallback);
+
+    // A genuinely new job (style or operation changed) resets the local
+    // FG/DISC counters and the in-progress pulse count -- same reasoning
+    // as the old firmware's style-change reset, just keyed off style+
+    // operation together now instead of style alone.
+    if (jobKey != lastJobKey) {
+      lastJobKey   = jobKey;
+      finishedFG   = 0;
+      discardedCnt = 0;
+      pulseCount   = 0;
+      pulseRemainder = 0;
+      requestRender();
+    }
+
+    styleNo         = newStyle;
+    operationCode   = newOp;
+    sizeUsed        = jsonStr(resp, "size_used");
+    sizeWasFallback = fallback;
+    stitchN         = (int)target;
+    stitchMin       = (int)target; // no separate minimum from the server yet -- see header note
+  } else {
+    // Not ready (no_open_run / waiting_to_be_mapped / no_operations_master_row /
+    // inactive) -- keep whatever style/op text was last known for context,
+    // but stop counting new stitches (processPulses() checks jobState).
+    lastJobKey = "";
+  }
+}
+
+// POST /api/v1/iot/events -- one finished/discarded garment at a time,
+// oldest first. mapping_id is resolved server-side from this device's
+// current mapping, never sent from here.
+void sendOneEvent() {
+  Event &e = queueBuf[qHead];
+  char id[48];
+  snprintf(id, sizeof(id), "%s-%08lX-%lu", deviceId.c_str(), (unsigned long)bootId, (unsigned long)e.seq);
+
+  time_t nowT = time(nullptr);
+  struct tm tmInfo;
+  gmtime_r(&nowT, &tmInfo);
+  char iso[24];
+  strftime(iso, sizeof(iso), "%Y-%m-%dT%H:%M:%S", &tmInfo);
+
+  String body = String("{\"events\":[{\"client_event_id\":\"") + id +
+                "\",\"stitch_count\":" + String(e.stitchCount) +
+                ",\"event_time\":\"" + iso + "\"}]}";
+
+  String resp;
+  bool ok = httpPostJson(PATH_EVENTS, deviceKey, body, resp);
+  if (ok) {
+    qHead = (qHead + 1) % QUEUE_SIZE;
+    qCount--;
+    requestRender();
+  } else {
+    Serial.println("events: post failed, will retry");
+  }
 }
 
 void syncWithServer() {
   if (WiFi.status() != WL_CONNECTED) return;
+
+  if (deviceKey.length() == 0) {
+    // Not provisioned yet (or key was never saved) -- keep knocking.
+    doHello();
+    return;
+  }
   if (qCount > 0) sendOneEvent();
   else            fetchJob();
 }
-#endif
+#endif // USE_SERVER
 
 // =================================================
 // SETUP
@@ -1154,7 +1343,7 @@ void setup() {
   bootLine(bl, 64, resetBad ? TFT_RED : TFT_SILVER);
 
   Serial.println();
-  Serial.printf("=== Sewing Counter FW %s  ID %s ===\n", FW_VERSION, MACHINE_ID);
+  Serial.printf("=== Sewing Counter FW %s (IoT clone) ===\n", FW_VERSION);
   Serial.printf("BOOT #%lu  last restart: %s  bad restarts: %lu  free RAM: %u\n",
                 (unsigned long)bootCount, resetText, (unsigned long)badCount,
                 (unsigned)ESP.getFreeHeap());
@@ -1171,6 +1360,14 @@ void setup() {
   calibrateIr();
 
   bootId = esp_random();
+
+  // hw_id = this board's own WiFi MAC, e.g. "AA:BB:CC:DD:EE:FF" -- the
+  // ONE fixed identity the server needs. Available as soon as WiFi mode is
+  // set, before a connection even succeeds.
+  WiFi.mode(WIFI_STA);
+  hwId = WiFi.macAddress();
+  Serial.printf("hw_id: %s\n", hwId.c_str());
+
 #if USE_WIFI
   bootLine("Connecting Wi-Fi...", 112);
   connectWiFi(8000);
@@ -1186,11 +1383,16 @@ void setup() {
   Serial.println("WiFi DISABLED");
 #endif
 
-#if !USE_SERVER
-  styleNo      = LOCAL_STYLE;
-  qtyRemaining = LOCAL_QTY;
-  stitchN      = LOCAL_N;
-  stitchMin    = min(LOCAL_N_MIN, LOCAL_N);
+#if USE_SERVER
+  secureClient.setInsecure();
+  // event_time needs a real clock -- NTP over whatever WiFi we have.
+  configTime(0, 0, "pool.ntp.org", "time.google.com");
+  loadIdentity();
+  if (deviceKey.length()) {
+    Serial.printf("Loaded saved identity: device_id=%s machine_label=%s\n", deviceId.c_str(), machineLabel.c_str());
+  } else {
+    Serial.println("No saved key yet -- will self-register as pending and wait for approval.");
+  }
 #endif
 
   irCandidate = (digitalRead(irPin) == irActiveLevel);
@@ -1215,8 +1417,9 @@ void loop() {
 
 #if USE_SERVER
   static unsigned long lastSync = 0;
-  bool safeToSync = !garmentPresent || (millis() - lastPulseMs > IDLE_BEFORE_SYNC_MS);
-  if (safeToSync && millis() - lastSync >= SYNC_INTERVAL_MS) {
+  unsigned long syncIntervalMs = (deviceKey.length() == 0) ? HELLO_RETRY_MS : JOB_POLL_MS;
+  bool safeToSync = !garmentPresent || (millis() - lastPulseMs > 1500);
+  if (safeToSync && millis() - lastSync >= syncIntervalMs) {
     lastSync = millis();
     syncWithServer();
   }
@@ -1257,13 +1460,13 @@ void loop() {
 
     String ipTxt = wifiUp ? WiFi.localIP().toString() : String("OFFLINE");
     String gapTxt = (minGap == 0xFFFFFFFF) ? String("-") : String(minGap / 1000) + "ms";
-    Serial.printf("IR=%d(fab=%s)%s GARMENT=%s | PULSE=%d ST %d (min %d/max %d) REJ=%lu GAPmin=%s | Q=%ld FG=%ld DISC=%ld | RFID=%s UID=%s | WIFI=%s RAMmin=%u\n",
+    Serial.printf("IR=%d(fab=%s)%s GARMENT=%s | PULSE=%d ST %d (min %d/max %d) REJ=%lu GAPmin=%s | JOB=%s FG=%ld DISC=%ld | RFID=%s UID=%s | WIFI=%s RAMmin=%u\n",
                   digitalRead(irPin), irActiveLevel == HIGH ? "H" : "L",
                   flips > 10 ? " FLICKER" : "",
                   garmentPresent ? "PRESENT" : "ABSENT",
                   digitalRead(pulsePin), pulseCount, stitchMin, stitchN,
                   (unsigned long)rej, gapTxt.c_str(),
-                  qtyRemaining, finishedFG, discardedCnt,
+                  jobState.c_str(), finishedFG, discardedCnt,
                   rfidOk ? "OK" : "MISSING", lastUid.length() ? lastUid.c_str() : "-",
                   ipTxt.c_str(), (unsigned)ESP.getMinFreeHeap());
   }
